@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
@@ -156,6 +157,13 @@ const Form = ({ catalog }: { readonly catalog: Catalog }) => {
             You sign in at the machine&apos;s console as{" "}
             <span className="font-mono text-foreground-secondary">{chosenImage?.defaultUser ?? "the default user"}</span> with
             this password. It is stored only as a hash and can&apos;t be shown again.
+          </p>
+          <p className="text-xs text-foreground-tertiary">
+            Your registered{" "}
+            <Link href="/keys/" className="text-foreground-secondary underline-offset-2 hover:underline">
+              SSH keys
+            </Link>{" "}
+            are added to the machine too, for SSH through the jump host.
           </p>
         </div>
         <FormField label="Password" htmlFor="machine-password" hint={`${passwordMinimum}–${passwordMaximum} characters.`}>

@@ -50,3 +50,14 @@ export type NewMachineRequest = {
   readonly diskGiB: number;
   readonly password: string;
 };
+
+/** A member's SSH public key (GET /api/keys). */
+export type SshKey = {
+  readonly id: string;
+  readonly fingerprint: string;
+  readonly type: string;
+  readonly label: string;
+  readonly createdAt: string;
+};
+
+export type NewKeyRequest = { readonly publicKey: string; readonly label: string };

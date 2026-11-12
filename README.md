@@ -28,11 +28,18 @@ It is a Next.js static export served by a small Go binary, on its own origin.
   - Its run strategy is `Manual`: it runs when started from the portal, and a shutdown from inside
     the guest leaves it stopped.
   - Deleting the VM deletes its disk and Secret with it.
-- **Limits** are per member: machines, vCPUs, memory and disk, counted over the member's machines,
-  running or not. Creates run one at a time, each counting live from the API server, so the limits
-  hold exactly. That's why there must be **exactly one replica**, replaced with the `Recreate`
-  strategy so two never overlap.
-- **Open streams** (live views and consoles) are capped per member (`-max-streams`).
+- **Data lives in two places.** The machine itself is its KubeVirt object (what it is and does). Whose
+  it is lives in Postgres, next to the members and their SSH keys: `machines(id, owner, …)`,
+  `members`, `ssh_keys`. Create writes the row first, then the VM; delete removes the VM, and the VM
+  watch removes the row once it's gone. A crash leaves at most a row without a VM (shown as failed;
+  the member deletes it), never a VM nobody owns.
+- **Limits** are per member (machines, vCPUs, memory, disk) and checked in one SERIALIZABLE
+  transaction with the insert, so they hold however many requests arrive at once.
+- **Open streams** (live views, consoles and bastion sessions) are capped per member (`-max-streams`).
+- **SSH keys** are registered in the portal (one member per key) and go into each machine created
+  afterwards (cloud-init `ssh_authorized_keys`).
+- **The SSH bastion** (optional, `-ssh-listen`): `ssh -J host:port user@vm-xxxxxx`. The key says who
+  you are; the only thing allowed is forwarding to port 22 of a running machine of yours.
 - **Live state** comes from an informer on the namespace's VMs and DataVolumes, and reaches the
   browser as server-sent events (`/api/vms/events`). There is no polling.
 - **Consoles**: the browser's websocket is passed through to KubeVirt's VMI `console` and `vnc`
@@ -65,8 +72,12 @@ vmservice -namespace vms -catalog /etc/vmservice/catalog.yaml -origin https://vm
 | `-groups-claim` | `groups` | a list of group names; a leading `/` is ignored |
 | `-username-claim` | `preferred_username` | shown to the user and kept as an annotation; ownership uses `sub` |
 | `-session-key-file` | (required) | 32 bytes, raw or base64 |
+| `-database-url-file` | (required) | a file holding the Postgres URL; the schema is migrated at start |
 | `-session-lifetime` | `168h` | how long a sign-in lasts |
-| `-max-streams` | `8` | open consoles and live views per member, together |
+| `-max-streams` | `8` | open consoles, live views and bastion sessions per member, together |
+| `-ssh-listen` | | the bastion's listen address, e.g. `:2222`; empty: no bastion |
+| `-ssh-host-key-file` | | the bastion's host key (OpenSSH private key file) |
+| `-ssh-public` | `-origin`'s host, `-ssh-listen`'s port | the bastion's `host:port` as members reach it (shown in the UI) |
 | `-title` | `VMService` | sidebar and tab title |
 | `-login-provider` | | name on the button ("Sign in with …") |
 
@@ -74,6 +85,7 @@ Serves `/` (pages), `/config.json`, `/api/…`, `/auth/…` and `/healthz`.
 
 ## Cluster requirements
 
+- **Postgres** (any recent version) for members, rights and SSH keys.
 - **KubeVirt and CDI.** The images are PVCs in `-namespace`, for example DataVolumes imported from
   the distributions' cloud images. A storage class with CSI snapshots lets CDI clone them without
   copying.
@@ -95,7 +107,7 @@ Serves `/` (pages), `/config.json`, `/api/…`, `/auth/…` and `/healthz`.
 ```sh
 cd web && npm install && npm run dev      # the UI on :3000, forwarding /api, /auth and /config.json to VMSERVICE_DEV (default http://127.0.0.1:8080)
 cd web && npm run embed                   # build the export into internal/web/ui
-go test ./internal/...
+go test ./internal/...                    # VMSERVICE_TEST_DATABASE_URL=postgres://… also runs the store tests on a scratch Postgres
 ```
 
 ## License

@@ -29,6 +29,14 @@ func UI() fs.FS {
 type Config struct {
 	Title         string `json:"title"`
 	LoginProvider string `json:"loginProvider"`
+	// SSH is how members reach the bastion; nil when it's off.
+	SSH *SSH `json:"ssh"`
+}
+
+// SSH is the bastion's public address, as members type it after ssh -J.
+type SSH struct {
+	Host string `json:"host"`
+	Port int    `json:"port"`
 }
 
 // basePolicy is the Content-Security-Policy of every response: everything from this origin. The

@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/cyoung06/vmservice/internal/config"
+	"github.com/cyoung06/vmservice/internal/store"
 )
 
 // The labels and annotations the service puts on what it creates. Only the service writes to the
@@ -23,13 +24,7 @@ import (
 const (
 	LabelOwner     = "vmservice/owner"      // the member's stable id (auth.OwnerID), not their username
 	LabelMachine   = "vmservice/machine"    // the machine id, also on the VM's pod
-	AnnotationName = "vmservice/name"       // the display name
 	AnnotationUser = "vmservice/owner-name" // the owner's username when the machine was made, for admins
-	AnnotationImg  = "vmservice/image"
-	AnnotationSize = "vmservice/size"
-	AnnotationCPU  = "vmservice/cpu"
-	AnnotationMem  = "vmservice/memory-mib"
-	AnnotationDisk = "vmservice/disk-gib"
 )
 
 // Machine is a member's VM as the API shows it.
@@ -59,6 +54,8 @@ type Request struct {
 	DiskGiB   int
 	// PasswordHash is the SHA-512 crypt hash of the default user's password.
 	PasswordHash string
+	// AuthorizedKeys are the default user's SSH keys (authorized_keys lines); filled by Create.
+	AuthorizedKeys []string
 }
 
 const idAlphabet = "abcdefghijkmnpqrstuvwxyz23456789" // no 0/o, 1/l
@@ -103,15 +100,7 @@ func buildVM(namespace, id, owner, storageClass string, r Request) *kubevirtv1.V
 	return &kubevirtv1.VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: id, Namespace: namespace, Labels: labels,
-			Annotations: map[string]string{
-				AnnotationName: r.Name,
-				AnnotationUser: r.OwnerName,
-				AnnotationImg:  r.Image.ID,
-				AnnotationSize: r.Size.ID,
-				AnnotationCPU:  strconv.Itoa(r.Size.CPU),
-				AnnotationMem:  strconv.Itoa(r.Size.MemoryMiB),
-				AnnotationDisk: strconv.Itoa(r.DiskGiB),
-			},
+			Annotations: map[string]string{AnnotationUser: r.OwnerName}, // for admins; the row is the authority
 		},
 		Spec: kubevirtv1.VirtualMachineSpec{
 			RunStrategy: &manual,
@@ -164,6 +153,10 @@ func cloudConfig(id string, r Request) ([]byte, error) {
 	}
 	doc["hostname"] = id
 	doc["ssh_pwauth"] = false
+	delete(doc, "ssh_authorized_keys") // only the member's own keys, never the image's extras
+	if len(r.AuthorizedKeys) > 0 {
+		doc["ssh_authorized_keys"] = r.AuthorizedKeys
+	}
 	doc["chpasswd"] = map[string]any{
 		"expire": false,
 		"users":  []any{map[string]any{"name": r.Image.DefaultUser, "password": r.PasswordHash, "type": "hash"}},
@@ -190,28 +183,28 @@ func buildSecret(vm *kubevirtv1.VirtualMachine, userData []byte) *corev1.Secret 
 	}
 }
 
-func annotationInt(vm *kubevirtv1.VirtualMachine, key string) int {
-	n, _ := strconv.Atoi(vm.Annotations[key])
-	return n
-}
+// missingGrace is how long a machine's row may exist without its VM before that counts as an
+// error: the row is written first and the VM a moment later (and the cache sees it later still).
+const missingGrace = 2 * time.Minute
 
-// toMachine is the API's view of a VM. disk is its root DataVolume, if known (for clone progress).
-func toMachine(vm *kubevirtv1.VirtualMachine, disk *cdiv1.DataVolume, catalog *config.Catalog) Machine {
+// toMachine is the API's view of a machine: its row, and its VM if it exists. disk is its root
+// DataVolume, if known (for clone progress).
+func toMachine(row store.Machine, vm *kubevirtv1.VirtualMachine, disk *cdiv1.DataVolume, catalog *config.Catalog, now time.Time) Machine {
 	m := Machine{
-		ID:        vm.Name,
-		Name:      vm.Annotations[AnnotationName],
-		Image:     vm.Annotations[AnnotationImg],
-		Size:      vm.Annotations[AnnotationSize],
-		CPU:       annotationInt(vm, AnnotationCPU),
-		MemoryMiB: annotationInt(vm, AnnotationMem),
-		DiskGiB:   annotationInt(vm, AnnotationDisk),
-		CreatedAt: vm.CreationTimestamp.UTC(),
+		ID: row.ID, Name: row.Name, Image: row.Image, ImageName: row.Image, Size: row.Size,
+		CPU: row.CPU, MemoryMiB: row.MemoryMiB, DiskGiB: row.DiskGiB, CreatedAt: row.CreatedAt.UTC(),
 	}
-	m.ImageName = m.Image // an image since removed from the catalog shows its id
 	if img, ok := catalog.Image(m.Image); ok {
 		m.ImageName, m.DefaultUser = img.Name, img.DefaultUser
 	}
-	m.State, m.Detail = state(vm, disk)
+	switch {
+	case vm != nil:
+		m.State, m.Detail = state(vm, disk)
+	case now.Sub(row.CreatedAt) < missingGrace:
+		m.State = "Provisioning"
+	default:
+		m.State, m.Detail = "Error", "Its VM is missing; delete the machine."
+	}
 	return m
 }
 

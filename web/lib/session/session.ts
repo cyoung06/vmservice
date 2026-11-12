@@ -13,6 +13,8 @@ export type UiConfiguration = {
   readonly title: string;
   /** The provider's name on the sign-in button. */
   readonly loginProvider: string;
+  /** The SSH bastion (jump host) for the machines; null when it's off. */
+  readonly ssh: { readonly host: string; readonly port: number } | null;
 };
 
 export type Session = {

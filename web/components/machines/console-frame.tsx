@@ -17,14 +17,22 @@ export const ConsoleFrame = ({
   status,
   onReconnect,
   actions,
+  fill = false,
   children,
 }: {
   readonly status: ConsoleStatus;
   readonly onReconnect: () => void;
   readonly actions?: ReactNode;
+  /** Take all the height the parent gives (a flex column) instead of a fixed height. */
+  readonly fill?: boolean;
   readonly children: ReactNode;
 }) => (
-  <div className="flex flex-col overflow-hidden rounded-lg border border-border">
+  <div
+    className={classNames(
+      "flex flex-col overflow-hidden border-border",
+      fill ? "min-h-0 flex-1" : "rounded-lg border",
+    )}
+  >
     <div className="flex h-9 items-center gap-2 border-b border-border bg-background-secondary px-3 text-xs">
       <span
         className={classNames(
@@ -41,6 +49,6 @@ export const ConsoleFrame = ({
         </Button>
       ) : null}
     </div>
-    <div className="h-[min(70vh,560px)] bg-background-secondary">{children}</div>
+    <div className={classNames("bg-background-secondary", fill ? "min-h-0 flex-1" : "h-[min(70vh,560px)]")}>{children}</div>
   </div>
 );

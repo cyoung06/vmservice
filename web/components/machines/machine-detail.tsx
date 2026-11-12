@@ -1,12 +1,16 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useState } from "react";
 
 import { Details } from "@/components/data/details";
 import { PageHeader } from "@/components/layout/page-header";
+import { useSession } from "@/components/session/session-context";
 import { Button } from "@/components/ui/button";
+import { CopyLine } from "@/components/ui/copy-line";
 import { DialogFrame } from "@/components/ui/dialog-frame";
+import { TextInput } from "@/components/ui/text-input";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorText } from "@/components/ui/error-text";
 import { Icon } from "@/components/ui/icon";
@@ -14,15 +18,13 @@ import { post, remove } from "@/lib/api/http";
 import type { Machine } from "@/lib/api/types";
 import { formatCpu, formatMemory, formatTime } from "@/lib/formatting/format";
 import { useAction } from "@/lib/hooks/use-action";
+import { sshCommand } from "@/lib/paths";
 import { classNames } from "@/lib/utilities/class-names";
 
 import { LiveNotice } from "./live-notice";
 import { MachineStateBadge } from "./machine-state";
 import { useMachines } from "./machines-context";
-import { SerialConsole } from "./serial-console";
-import { VncConsole } from "./vnc-console";
-
-type ConsoleKind = "serial" | "vnc";
+import { ConsoleTab } from "./console-tab";
 
 const Section = ({ title, children }: { readonly title: string; readonly children: React.ReactNode }) => (
   <section className="flex flex-col gap-3">
@@ -34,25 +36,45 @@ const Section = ({ title, children }: { readonly title: string; readonly childre
 const DeleteDialog = ({ machine, onClose }: { readonly machine: Machine; readonly onClose: () => void }) => {
   const router = useRouter();
   const action = useAction();
+  const [typed, setTyped] = useState("");
+  // The member types the machine's name to confirm: deleting can't be undone.
+  const confirmed = typed === machine.name;
   return (
     <DialogFrame
       title={`Delete ${machine.name}?`}
       onClose={onClose}
       submitLabel="Delete machine"
       danger
+      submitDisabled={!confirmed}
       pending={action.pending}
       error={action.error}
-      onSubmit={() =>
+      onSubmit={() => {
+        if (!confirmed) {
+          return;
+        }
         void action.run(() => remove(`/api/vms/${encodeURIComponent(machine.id)}`)).then((done) => {
           if (done) {
             router.push("/");
           }
-        })
-      }
+        });
+      }}
     >
       <p className="text-[13px] text-foreground-secondary">
         The machine and its {machine.diskGiB} GiB disk are deleted, with everything on it. This can&apos;t be undone.
       </p>
+      <label className="mt-3 flex flex-col gap-1.5 text-[13px] text-foreground-secondary" htmlFor="delete-confirm">
+        <span>
+          Type <span className="font-mono text-foreground">{machine.name}</span> to confirm.
+        </span>
+        <TextInput
+          id="delete-confirm"
+          data-autofocus=""
+          value={typed}
+          onChange={(event) => setTyped(event.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+        />
+      </label>
     </DialogFrame>
   );
 };
@@ -97,45 +119,46 @@ const Actions = ({ machine }: { readonly machine: Machine }) => {
   );
 };
 
-const ConsoleTabs = ({ machine }: { readonly machine: Machine }) => {
-  const [kind, setKind] = useState<ConsoleKind>("serial");
-  const tab = (value: ConsoleKind, label: string) => (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={kind === value}
-      onClick={() => setKind(value)}
-      className={classNames(
-        "h-7 rounded-md px-2.5 text-[13px] transition-colors",
-        kind === value
-          ? "bg-background-quaternary/70 font-medium text-foreground"
-          : "text-foreground-secondary hover:bg-background-tertiary hover:text-foreground",
-      )}
-    >
-      {label}
-    </button>
-  );
-  if (machine.state !== "Running") {
-    return (
-      <p className="rounded-lg border border-border bg-background-secondary px-4 py-6 text-center text-xs text-foreground-tertiary">
-        The consoles open once the machine is running.
-      </p>
-    );
-  }
+type Tab = "overview" | "console";
+
+const Overview = ({ machine }: { readonly machine: Machine }) => {
+  const { configuration } = useSession();
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <div role="tablist" aria-label="Console" className="flex gap-0.5">
-          {tab("serial", "Serial")}
-          {tab("vnc", "VNC")}
-        </div>
-        <span className="flex-1" />
-        <span className="text-xs text-foreground-tertiary">
-          Sign in as <span className="font-mono text-foreground-secondary">{machine.defaultUser}</span> with the password
-          you set{kind === "serial" ? "; press Enter if there is no prompt" : ""}.
-        </span>
+    <div className="scrollbar-thin min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto flex max-w-[1080px] flex-col gap-8 px-4 py-5 md:px-8 md:py-6">
+        <Section title="Details">
+          <Details
+            items={[
+              ["Image", machine.imageName],
+              ["Size", `${formatCpu(machine.cpu)} · ${formatMemory(machine.memoryMiB)}`],
+              ["Disk", `${machine.diskGiB} GiB`],
+              ["User", <span key="user" className="font-mono text-xs">{machine.defaultUser}</span>],
+              ["Created", formatTime(machine.createdAt)],
+              ["ID", <span key="id" className="font-mono text-xs">{machine.id}</span>],
+            ]}
+          />
+        </Section>
+        <Section title="Connect">
+          <div className="flex flex-col gap-3 text-xs text-foreground-tertiary">
+            <p>
+              On the console, sign in as <span className="font-mono text-foreground-secondary">{machine.defaultUser}</span>{" "}
+              with the password you set when you made the machine.
+            </p>
+            {configuration.ssh ? (
+              <div className="flex flex-col gap-1.5">
+                <p>
+                  With SSH, through the jump host, using a key you registered under{" "}
+                  <Link href="/keys/" className="text-foreground-secondary underline-offset-2 hover:underline">
+                    SSH keys
+                  </Link>{" "}
+                  before the machine was made:
+                </p>
+                <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser, machine.id)} />
+              </div>
+            ) : null}
+          </div>
+        </Section>
       </div>
-      {kind === "serial" ? <SerialConsole machineId={machine.id} /> : <VncConsole machineId={machine.id} />}
     </div>
   );
 };
@@ -144,6 +167,24 @@ export const MachineDetail = () => {
   const id = useSearchParams().get("id") ?? "";
   const { machines } = useMachines();
   const machine = machines?.find((item) => item.id === id) ?? null;
+  const [tab, setTab] = useState<Tab>("overview");
+
+  const tabButton = (value: Tab, label: string) => (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={tab === value}
+      onClick={() => setTab(value)}
+      className={classNames(
+        "-mb-px h-9 border-b-2 px-1 text-[13px] transition-colors",
+        tab === value
+          ? "border-foreground font-medium text-foreground"
+          : "border-transparent text-foreground-secondary hover:text-foreground",
+      )}
+    >
+      {label}
+    </button>
+  );
 
   return (
     <>
@@ -152,21 +193,21 @@ export const MachineDetail = () => {
         icon={<Icon name="server" size={15} />}
         breadcrumbs={["Machines"]}
       />
-      <div className="scrollbar-thin min-h-0 min-w-0 flex-1 overflow-y-auto">
-        {machines === null ? (
-          <div className="mx-auto flex max-w-[1080px] flex-col gap-4 px-4 py-5 md:px-8 md:py-8">
-            <LiveNotice />
-            <div className="py-12 text-center text-xs text-foreground-tertiary">Loading…</div>
-          </div>
-        ) : !machine ? (
-          <EmptyState
-            fill
-            icon={<Icon name="server" size={18} />}
-            title="No such machine"
-            description="It was deleted, or it isn't yours."
-          />
-        ) : (
-          <div className="mx-auto flex max-w-[1080px] flex-col gap-8 px-4 py-5 md:px-8 md:py-8">
+      {machines === null ? (
+        <div className="mx-auto flex w-full max-w-[1080px] flex-col gap-4 px-4 py-5 md:px-8 md:py-8">
+          <LiveNotice />
+          <div className="py-12 text-center text-xs text-foreground-tertiary">Loading…</div>
+        </div>
+      ) : !machine ? (
+        <EmptyState
+          fill
+          icon={<Icon name="server" size={18} />}
+          title="No such machine"
+          description="It was deleted, or it isn't yours."
+        />
+      ) : (
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex flex-col gap-3 border-b border-border px-4 pt-4 md:px-8">
             <LiveNotice />
             <div className="flex flex-wrap items-start gap-4">
               <div className="flex min-w-0 flex-1 flex-col gap-1">
@@ -182,24 +223,14 @@ export const MachineDetail = () => {
               </div>
               <Actions machine={machine} />
             </div>
-            <Section title="Details">
-              <Details
-                items={[
-                  ["Image", machine.imageName],
-                  ["Size", `${formatCpu(machine.cpu)} · ${formatMemory(machine.memoryMiB)}`],
-                  ["Disk", `${machine.diskGiB} GiB`],
-                  ["User", <span key="user" className="font-mono text-xs">{machine.defaultUser}</span>],
-                  ["Created", formatTime(machine.createdAt)],
-                  ["ID", <span key="id" className="font-mono text-xs">{machine.id}</span>],
-                ]}
-              />
-            </Section>
-            <Section title="Console">
-              <ConsoleTabs machine={machine} />
-            </Section>
+            <div role="tablist" aria-label="Machine" className="flex gap-4">
+              {tabButton("overview", "Overview")}
+              {tabButton("console", "Console")}
+            </div>
           </div>
-        )}
-      </div>
+          {tab === "overview" ? <Overview machine={machine} /> : <ConsoleTab machine={machine} />}
+        </div>
+      )}
     </>
   );
 };

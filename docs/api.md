@@ -104,3 +104,31 @@ A member may have `-max-streams` event streams and consoles open together (defau
 Both must be opened with the subprotocol `plain.kubevirt.io`. They are KubeVirt's VMI `console`/`vnc`
 subresources passed through as they are. Both need the machine to be `Running`; otherwise the upgrade
 gets `409`. Both close when the session expires.
+
+## SSH keys
+
+A member's public keys: put into each machine they create from then on (cloud-init
+`ssh_authorized_keys`), and accepted by the SSH bastion. A key belongs to one member only, so it
+identifies them at the bastion.
+
+A key:
+
+```json
+{"id": "3f1c…64 hex…", "fingerprint": "SHA256:Pz6…", "type": "ssh-ed25519", "label": "laptop", "createdAt": "2026-11-12T10:00:00Z"}
+```
+
+| | |
+| --- | --- |
+| `GET /api/keys` | `{"keys": [key, ...]}`: the caller's keys, newest first |
+| `POST /api/keys` | body `{"publicKey": "ssh-ed25519 AAAA… comment", "label": "laptop"}` → `201` key. `400` for a key that isn't one OpenSSH public key line (ed25519, ECDSA, or RSA ≥ 2048 bits; no options) or a bad label, `409` when the key is already registered (by anyone), `403` at 20 keys |
+| `DELETE /api/keys/{id}` | `204`; `404` if it isn't the caller's. Machines made earlier keep the key; the bastion stops accepting it |
+
+`label`: 0–63 characters, display only. The comment on the key line is dropped; the label is shown instead (the comment is the default label when none is given).
+
+`GET /config.json` also says how to reach the bastion: `"ssh": {"host": "cloud.example.org", "port": 222}`, or `"ssh": null` when it's off.
+
+## SSH bastion
+
+`ssh -J <host>:<port> <user>@<machine id>`, e.g. `ssh -J cloud.example.org:222 ubuntu@vm-7k2q9x`.
+The jump host takes any username: the key says who you are. It allows nothing but forwarding to port
+22 of a running machine of yours (no shell, no other ports or hosts); the machine id is the host name.

@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/cyoung06/vmservice/internal/config"
+	"github.com/cyoung06/vmservice/internal/store"
 )
 
 var catalog = &config.Catalog{
@@ -58,11 +59,14 @@ func testService(t *testing.T) (*Service, *[]string) {
 	t.Cleanup(srv.Close)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	st := store.NewMemory()
+	st.UpsertMember(ctx, "alice", "alice")
+	st.UpsertMember(ctx, "bob", "bob")
 	s := &Service{
 		Namespace: "cloud", Catalog: catalog, Config: &rest.Config{Host: srv.URL},
-		read: c, write: c, http: srv.Client(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		read: c, write: c, store: st, SignInValid: time.Hour, http: srv.Client(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	s.run(ctx)
+	s.hub = newHub(ctx, s.render)
 	return s, calls
 }
 
@@ -198,7 +202,7 @@ func TestLimits(t *testing.T) {
 		t.Errorf("bob's limits are his own: %v", err)
 	}
 	u, _ := s.Usage(ctx, "alice")
-	if u != (Usage{VMs: 2, CPU: 4, MemoryMiB: 4096, DiskGiB: 40}) {
+	if u != (store.Usage{VMs: 2, CPU: 4, MemoryMiB: 4096, DiskGiB: 40}) {
 		t.Errorf("usage = %+v", u)
 	}
 }
@@ -264,6 +268,7 @@ func TestEventsGoToTheOwnerOnly(t *testing.T) {
 	bob, stopB := s.Subscribe("bob")
 	defer stopB()
 	vm := buildVM("cloud", "vm-aaaaaa", "alice", "", request(t))
+	s.store.CreateMachine(context.Background(), store.Machine{ID: "vm-aaaaaa", Owner: "alice", Name: "box"}, func(store.Usage) error { return nil })
 	if err := s.write.Create(context.Background(), vm); err != nil {
 		t.Fatal(err)
 	}
@@ -277,11 +282,14 @@ func TestEventsGoToTheOwnerOnly(t *testing.T) {
 		t.Fatal("alice got nothing")
 	}
 	s.write.Delete(context.Background(), vm)
-	s.changed(vm)
+	s.vmGone(vm)
 	select {
 	case e := <-alice:
 		if e.Kind != "deleted" {
 			t.Errorf("alice got %+v", e)
+		}
+		if _, err := s.store.Machine(context.Background(), "vm-aaaaaa"); err == nil {
+			t.Error("the row outlived its VM") // the delete event comes after the row is gone
 		}
 	case <-time.After(time.Second):
 		t.Fatal("alice got no delete")
@@ -290,5 +298,28 @@ func TestEventsGoToTheOwnerOnly(t *testing.T) {
 	case e := <-bob:
 		t.Errorf("bob got alice's event %+v", e)
 	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func (s *Service) secretUserData(ctx context.Context, id string) ([]byte, error) {
+	var secret corev1.Secret
+	if err := s.read.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: id + "-init"}, &secret); err != nil {
+		return nil, err
+	}
+	return secret.Data["userdata"], nil
+}
+
+// Deleting a machine whose VM doesn't exist: refused while a create could still be under way,
+// allowed (and the row removed) after the grace period.
+func TestDeleteMissingVM(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-mmmmmm", Owner: "alice", Name: "x"}, func(store.Usage) error { return nil })
+	if err := s.Delete(ctx, "alice", "vm-mmmmmm"); status(err) != http.StatusConflict {
+		t.Errorf("delete right after the row = %v, want 409 (a create may still be making the VM)", err)
+	}
+	m, _ := s.Get(ctx, "alice", "vm-mmmmmm")
+	if m.State != "Provisioning" {
+		t.Errorf("state = %s, want Provisioning within the grace period", m.State)
 	}
 }

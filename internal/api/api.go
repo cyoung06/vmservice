@@ -10,13 +10,12 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/cyoung06/vmservice/internal/auth"
 	"github.com/cyoung06/vmservice/internal/console"
+	"github.com/cyoung06/vmservice/internal/limit"
 	"github.com/cyoung06/vmservice/internal/machines"
 )
 
@@ -26,35 +25,18 @@ type API struct {
 	machines *machines.Service
 	console  *console.Proxy
 	origin   string
-	streams  *streams
+	streams  *limit.PerOwner
 	log      *slog.Logger
 }
 
 // New is the API for origin (the public origin, no trailing slash; writes and consoles from another
-// Origin are refused). maxStreams caps each member's open event streams and consoles together.
-func New(a *auth.Auth, m *machines.Service, c *console.Proxy, origin string, maxStreams int, log *slog.Logger) *API {
-	return &API{auth: a, machines: m, console: c, origin: origin, streams: &streams{max: int64(maxStreams)}, log: log}
-}
-
-// streams counts each member's open long-lived connections (event streams and consoles).
-type streams struct {
-	max  int64
-	open sync.Map // owner -> *atomic.Int64
-}
-
-// take reserves one of owner's streams; release gives it back. false: the member is at the cap.
-func (s *streams) take(owner string) (release func(), ok bool) {
-	v, _ := s.open.LoadOrStore(owner, new(atomic.Int64))
-	n := v.(*atomic.Int64)
-	if n.Add(1) > s.max {
-		n.Add(-1)
-		return nil, false
-	}
-	return func() { n.Add(-1) }, true
+// Origin are refused). streams caps each member's open event streams, consoles and SSH sessions.
+func New(a *auth.Auth, m *machines.Service, c *console.Proxy, origin string, streams *limit.PerOwner, log *slog.Logger) *API {
+	return &API{auth: a, machines: m, console: c, origin: origin, streams: streams, log: log}
 }
 
 func (a *API) tooMany(w http.ResponseWriter) {
-	reply(w, http.StatusTooManyRequests, detail(fmt.Sprintf("You have %d consoles and live views open; close some first.", a.streams.max)))
+	reply(w, http.StatusTooManyRequests, detail(fmt.Sprintf("You have %d consoles, live views and SSH sessions open; close some first.", a.streams.Max)))
 }
 
 // Routes adds the API's endpoints to mux.
@@ -67,6 +49,9 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms", a.write(a.create))
 	mux.HandleFunc("POST /api/vms/{id}/{action}", a.write(a.action))
 	mux.HandleFunc("DELETE /api/vms/{id}", a.write(a.remove))
+	mux.HandleFunc("GET /api/keys", a.read(a.keys))
+	mux.HandleFunc("POST /api/keys", a.write(a.addKey))
+	mux.HandleFunc("DELETE /api/keys/{id}", a.write(a.deleteKey))
 	mux.HandleFunc("GET /api/vms/{id}/serial", a.consoleOf("console"))
 	mux.HandleFunc("GET /api/vms/{id}/vnc", a.consoleOf("vnc"))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -200,12 +185,44 @@ func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
 	if n := utf8.RuneCountInString(b.Password); n < 8 || n > 128 || control.MatchString(b.Password) {
 		return 0, nil, bad("The password must be 8 to 128 characters, without control characters.")
 	}
+	if err := a.machines.EnsureMember(r.Context(), s.Owner, s.Username); err != nil {
+		return 0, nil, err
+	}
 	hash, err := machines.HashPassword(b.Password)
 	if err != nil {
 		return 0, nil, err
 	}
 	m, err := a.machines.Create(r.Context(), s.Owner, machines.Request{Name: b.Name, OwnerName: s.Username, Image: img, Size: size, DiskGiB: b.DiskGiB, PasswordHash: hash})
 	return http.StatusCreated, m, err
+}
+
+func (a *API) keys(r *http.Request, s auth.Session) (int, any, error) {
+	keys, err := a.machines.Keys(r.Context(), s.Owner)
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusOK, map[string]any{"keys": keys}, nil
+}
+
+func (a *API) addKey(r *http.Request, s auth.Session) (int, any, error) {
+	var b struct {
+		PublicKey string `json:"publicKey"`
+		Label     string `json:"label"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 16<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&b); err != nil {
+		return 0, nil, bad("The request isn't valid JSON for a key.")
+	}
+	if err := a.machines.EnsureMember(r.Context(), s.Owner, s.Username); err != nil {
+		return 0, nil, err
+	}
+	k, err := a.machines.AddKey(r.Context(), s.Owner, b.PublicKey, b.Label)
+	return http.StatusCreated, k, err
+}
+
+func (a *API) deleteKey(r *http.Request, s auth.Session) (int, any, error) {
+	return http.StatusNoContent, nil, a.machines.DeleteKey(r.Context(), s.Owner, r.PathValue("id"))
 }
 
 func (a *API) action(r *http.Request, s auth.Session) (int, any, error) {
@@ -229,7 +246,7 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusUnauthorized, detail("Sign in first."))
 		return
 	}
-	release, ok := a.streams.take(s.Owner)
+	release, ok := a.streams.Take(s.Owner)
 	if !ok {
 		a.tooMany(w)
 		return
@@ -302,7 +319,7 @@ func (a *API) consoleOf(kind string) http.HandlerFunc {
 			reply(w, http.StatusConflict, detail("The machine isn't running."))
 			return
 		}
-		release, ok := a.streams.take(s.Owner)
+		release, ok := a.streams.Take(s.Owner)
 		if !ok {
 			a.tooMany(w)
 			return

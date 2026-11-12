@@ -13,7 +13,7 @@ type Rfb = import("@novnc/novnc").default;
  * The VNC console: KubeVirt's VMI `vnc` subresource, passed through by vmservice, drawn by noVNC.
  * noVNC is loaded in the browser only.
  */
-export const VncConsole = ({ machineId }: { readonly machineId: string }) => {
+export const VncConsole = ({ machineId, fill = false }: { readonly machineId: string; readonly fill?: boolean }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<Rfb | null>(null);
   const [status, setStatus] = useState<ConsoleStatus>("connecting");
@@ -51,6 +51,7 @@ export const VncConsole = ({ machineId }: { readonly machineId: string }) => {
 
   return (
     <ConsoleFrame
+      fill={fill}
       status={status}
       onReconnect={() => {
         setStatus("connecting");

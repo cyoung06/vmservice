@@ -39,6 +39,9 @@ type Config struct {
 	UsernameClaim string
 	KeyFile       string
 	Lifetime      time.Duration
+	// OnSignIn, if set, runs before the session is issued (e.g. recording the member); an error
+	// refuses the sign-in.
+	OnSignIn func(ctx context.Context, owner, username string) error
 }
 
 // Session is a signed-in user.
@@ -231,6 +234,13 @@ func (a *Auth) callback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s := Session{Owner: OwnerID(a.cfg.Issuer, idToken.Subject), Username: user, Expires: time.Now().Add(a.cfg.Lifetime).Truncate(time.Second)}
+	if a.cfg.OnSignIn != nil {
+		if err := a.cfg.OnSignIn(ctx, s.Owner, s.Username); err != nil {
+			a.log.Error("sign-in hook", "user", user, "err", err)
+			a.refuse(w, http.StatusBadGateway, "The sign-in couldn't be recorded; try again in a moment.")
+			return
+		}
+	}
 	value, err := a.seal.seal(sessionCookie, s)
 	if err != nil {
 		a.refuse(w, http.StatusInternalServerError, "The session couldn't be created.")

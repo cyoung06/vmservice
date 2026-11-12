@@ -12,7 +12,7 @@ import { ConsoleFrame, type ConsoleStatus } from "./console-frame";
  * The serial console (ttyS0): KubeVirt's VMI `console` subresource, passed through by vmservice.
  * Raw bytes in binary frames both ways; xterm.js draws them. xterm is loaded in the browser only.
  */
-export const SerialConsole = ({ machineId }: { readonly machineId: string }) => {
+export const SerialConsole = ({ machineId, fill = false }: { readonly machineId: string; readonly fill?: boolean }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [status, setStatus] = useState<ConsoleStatus>("connecting");
   const [attempt, setAttempt] = useState(0);
@@ -88,6 +88,7 @@ export const SerialConsole = ({ machineId }: { readonly machineId: string }) => 
 
   return (
     <ConsoleFrame
+      fill={fill}
       status={status}
       onReconnect={() => {
         setStatus("connecting");

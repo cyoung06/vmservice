@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/cyoung06/vmservice/internal/auth"
+	"github.com/cyoung06/vmservice/internal/limit"
 	"github.com/cyoung06/vmservice/internal/web"
 )
 
@@ -41,7 +42,7 @@ func testAPI(t *testing.T) http.Handler {
 	// The whole server as main wires it: the UI, sign-in and the API on one mux (registering
 	// conflicting patterns panics here).
 	h, err := web.Handler(fstest.MapFS{"404.html": {Data: []byte("missing")}}, web.Config{}, "https://vm.example.org",
-		a.Routes, New(a, nil, nil, "https://vm.example.org", 8, log).Routes)
+		a.Routes, New(a, nil, nil, "https://vm.example.org", &limit.PerOwner{Max: 8}, log).Routes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,20 +98,5 @@ func TestLoginRedirectsToProviderWithPKCE(t *testing.T) {
 	}
 	if len(w.Result().Cookies()) != 1 || !w.Result().Cookies()[0].HttpOnly || !w.Result().Cookies()[0].Secure {
 		t.Errorf("login cookie = %+v", w.Result().Cookies())
-	}
-}
-
-func TestStreamCap(t *testing.T) {
-	s := &streams{max: 2}
-	r1, ok1 := s.take("a")
-	_, ok2 := s.take("a")
-	_, ok3 := s.take("a")
-	_, okB := s.take("b")
-	if !ok1 || !ok2 || ok3 || !okB {
-		t.Fatalf("take = %v %v %v %v; want the third of a's refused and b's own", ok1, ok2, ok3, okB)
-	}
-	r1()
-	if _, ok := s.take("a"); !ok {
-		t.Error("a released one but can't take it again")
 	}
 }
