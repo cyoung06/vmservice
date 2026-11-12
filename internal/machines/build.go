@@ -52,7 +52,8 @@ type Request struct {
 	Image     config.Image
 	Size      config.Size
 	DiskGiB   int
-	// PasswordHash is the SHA-512 crypt hash of the default user's password.
+	// PasswordHash is the SHA-512 crypt hash of the default user's password; empty: none (the user
+	// signs in with SSH keys only, and the console's login prompt can't be passed).
 	PasswordHash string
 	// AuthorizedKeys are the default user's SSH keys (authorized_keys lines); filled by Create.
 	AuthorizedKeys []string
@@ -157,9 +158,12 @@ func cloudConfig(id string, r Request) ([]byte, error) {
 	if len(r.AuthorizedKeys) > 0 {
 		doc["ssh_authorized_keys"] = r.AuthorizedKeys
 	}
-	doc["chpasswd"] = map[string]any{
-		"expire": false,
-		"users":  []any{map[string]any{"name": r.Image.DefaultUser, "password": r.PasswordHash, "type": "hash"}},
+	delete(doc, "chpasswd") // the member's password or none, never the image's extras
+	if r.PasswordHash != "" {
+		doc["chpasswd"] = map[string]any{
+			"expire": false,
+			"users":  []any{map[string]any{"name": r.Image.DefaultUser, "password": r.PasswordHash, "type": "hash"}},
+		}
 	}
 	body, err := yaml.Marshal(doc)
 	if err != nil {

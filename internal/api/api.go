@@ -182,15 +182,20 @@ func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
 	if b.DiskGiB < c.Disk.MinGiB || b.DiskGiB > c.Disk.MaxGiB {
 		return 0, nil, bad("The disk must be %d to %d GiB.", c.Disk.MinGiB, c.Disk.MaxGiB)
 	}
-	if n := utf8.RuneCountInString(b.Password); n < 8 || n > 128 || control.MatchString(b.Password) {
+	// Optional: without one the default user has no password (SSH keys only); Create refuses that
+	// when the member has no keys either.
+	if n := utf8.RuneCountInString(b.Password); b.Password != "" && (n < 8 || n > 128 || control.MatchString(b.Password)) {
 		return 0, nil, bad("The password must be 8 to 128 characters, without control characters.")
 	}
 	if err := a.machines.EnsureMember(r.Context(), s.Owner, s.Username); err != nil {
 		return 0, nil, err
 	}
-	hash, err := machines.HashPassword(b.Password)
-	if err != nil {
-		return 0, nil, err
+	var hash string
+	if b.Password != "" {
+		var err error
+		if hash, err = machines.HashPassword(b.Password); err != nil {
+			return 0, nil, err
+		}
 	}
 	m, err := a.machines.Create(r.Context(), s.Owner, machines.Request{Name: b.Name, OwnerName: s.Username, Image: img, Size: size, DiskGiB: b.DiskGiB, PasswordHash: hash})
 	return http.StatusCreated, m, err

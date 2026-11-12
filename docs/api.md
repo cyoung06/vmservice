@@ -82,7 +82,7 @@ Field rules for `POST /api/vms`:
 - **`name`:** 1–63 characters of any text. It's only a display name.
 - **`image` and `size`:** ids from the catalog.
 - **`diskGiB`:** an integer within `disk.minGiB` to `disk.maxGiB`.
-- **`password`:** 8–128 characters. It's the default user's password for the console login. It's stored only as a SHA-512 crypt hash and can't be shown again.
+- **`password`:** empty, or 8–128 characters: the default user's password for the console login, stored only as a SHA-512 crypt hash. Empty is allowed only when the caller has an SSH key (`400` otherwise): the user then signs in with SSH keys only.
 
 ### Live updates
 
@@ -131,4 +131,5 @@ A key:
 
 `ssh -J <host>:<port> <user>@<machine id>`, e.g. `ssh -J cloud.example.org:222 ubuntu@vm-7k2q9x`.
 The jump host takes any username: the key says who you are. It allows nothing but forwarding to port
-22 of a running machine of yours (no shell, no other ports or hosts); the machine id is the host name.
+22 of a running machine of yours (no shell, no other ports or hosts). The host name is the machine id,
+or its display name when that's a valid host name and no other machine of yours has it (ignoring case).

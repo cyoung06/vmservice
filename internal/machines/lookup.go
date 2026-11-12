@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -76,18 +77,41 @@ func (l *Lookup) KeyOwner(ctx context.Context, pk ssh.PublicKey) (string, time.T
 	return k.Owner, until, true
 }
 
-// Address is the pod-network address of the owner's running machine id.
-func (l *Lookup) Address(ctx context.Context, owner, id string) (string, error) {
-	if !idFormat.MatchString(id) {
-		return "", ErrNotFound
+// hostName is a display name that can be typed as an SSH host name.
+var hostName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
+// machineFor finds the owner's machine for a host typed after ssh -J: its id, or the display name of
+// exactly one of the owner's machines (ignoring case). Only the owner's own machines are searched.
+func (l *Lookup) machineFor(ctx context.Context, owner, host string) (store.Machine, error) {
+	if idFormat.MatchString(host) {
+		row, err := l.store.Machine(ctx, host)
+		if errors.Is(err, store.ErrNotFound) || (err == nil && row.Owner != owner) {
+			return store.Machine{}, ErrNotFound
+		}
+		return row, err
 	}
-	row, err := l.store.Machine(ctx, id)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && row.Owner != owner) {
-		return "", ErrNotFound
+	if !hostName.MatchString(host) {
+		return store.Machine{}, ErrNotFound
 	}
+	rows, err := l.store.MachinesNamed(ctx, owner, host)
+	switch {
+	case err != nil:
+		return store.Machine{}, err
+	case len(rows) == 0:
+		return store.Machine{}, ErrNotFound
+	case len(rows) > 1:
+		return store.Machine{}, refuse(http.StatusConflict, "%d of your machines are named %q; use the machine id (vm-…)", len(rows), host)
+	}
+	return rows[0], nil
+}
+
+// Address is the pod-network address of the owner's running machine, by id or by name.
+func (l *Lookup) Address(ctx context.Context, owner, host string) (string, error) {
+	row, err := l.machineFor(ctx, owner, host)
 	if err != nil {
-		return "", err // internal: the bastion shows members a generic message
+		return "", err // refusals are shown to the member; anything else the bastion keeps generic
 	}
+	id := row.ID
 	var vmi kubevirtv1.VirtualMachineInstance
 	if err := l.read.Get(ctx, client.ObjectKey{Namespace: l.Namespace, Name: id}, &vmi); err != nil || vmi.Status.Phase != kubevirtv1.Running {
 		return "", refuse(http.StatusConflict, "The machine isn't running.")

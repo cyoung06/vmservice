@@ -168,3 +168,64 @@ func TestLookupAddress(t *testing.T) {
 		t.Errorf("Address of a machine with no running instance = %v, want 409", err)
 	}
 }
+
+// No password: allowed only with an SSH key, and then the cloud-config sets no password at all
+// (not even one from the image's extras).
+func TestPasswordOptionalWithKeys(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	r := request(t)
+	r.PasswordHash = ""
+	r.Image.CloudConfig = map[string]any{"chpasswd": map[string]any{"users": []any{map[string]any{"name": "ubuntu", "password": "image-default"}}}}
+	if _, err := s.Create(ctx, "alice", r); status(err) != http.StatusBadRequest {
+		t.Fatalf("no password and no keys = %v, want 400", err)
+	}
+	if u, _ := s.Usage(ctx, "alice"); u.VMs != 0 {
+		t.Errorf("a refused create left %d machines", u.VMs)
+	}
+	line, _ := newKeyLine(t, "laptop")
+	if _, err := s.AddKey(ctx, "alice", line, ""); err != nil {
+		t.Fatal(err)
+	}
+	m, err := s.Create(ctx, "alice", r)
+	if err != nil {
+		t.Fatalf("no password with a key = %v", err)
+	}
+	data, _ := s.secretUserData(ctx, m.ID)
+	var doc map[string]any
+	yaml.Unmarshal(data, &doc)
+	if _, ok := doc["chpasswd"]; ok {
+		t.Errorf("cloud-config sets a password: %v", doc["chpasswd"])
+	}
+	if keys, _ := doc["ssh_authorized_keys"].([]any); len(keys) != 1 {
+		t.Errorf("ssh_authorized_keys = %v", doc["ssh_authorized_keys"])
+	}
+}
+
+// ssh -J … user@<name>: a name finds the owner's one machine of that name, case-insensitively;
+// a shared name is refused; other members' names don't count.
+func TestLookupByName(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	ok := func(store.Usage) error { return nil }
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-aaaaaa", Owner: "alice", Name: "MyBox"}, ok)
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-bbbbbb", Owner: "alice", Name: "twin"}, ok)
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-cccccc", Owner: "alice", Name: "twin"}, ok)
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-dddddd", Owner: "bob", Name: "mybox"}, ok)
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-eeeeee", Owner: "alice", Name: "my box"}, ok)
+	l := lookupFor(s)
+	if m, err := l.machineFor(ctx, "alice", "mybox"); err != nil || m.ID != "vm-aaaaaa" {
+		t.Errorf("alice's mybox = %v, %v", m.ID, err)
+	}
+	if m, err := l.machineFor(ctx, "bob", "MYBOX"); err != nil || m.ID != "vm-dddddd" {
+		t.Errorf("bob's mybox = %v, %v", m.ID, err)
+	}
+	if _, err := l.machineFor(ctx, "alice", "twin"); status(err) != http.StatusConflict {
+		t.Errorf("a shared name = %v, want 409", err)
+	}
+	for _, host := range []string{"my box", "nothing", "vm-dddddd", "../x"} {
+		if _, err := l.machineFor(ctx, "alice", host); err != ErrNotFound {
+			t.Errorf("alice → %q = %v, want not found", host, err)
+		}
+	}
+}

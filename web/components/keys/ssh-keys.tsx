@@ -1,5 +1,6 @@
 "use client";
 
+import { loadKeys } from "@/lib/api/keys";
 import { sshCommand } from "@/lib/paths";
 import { useState } from "react";
 
@@ -12,13 +13,12 @@ import { DialogFrame } from "@/components/ui/dialog-frame";
 import { ErrorText } from "@/components/ui/error-text";
 import { Icon } from "@/components/ui/icon";
 import { TextInput } from "@/components/ui/text-input";
-import { get, post, remove } from "@/lib/api/http";
+import { post, remove } from "@/lib/api/http";
 import type { NewKeyRequest, SshKey } from "@/lib/api/types";
 import { formatTime } from "@/lib/formatting/format";
 import { useAction } from "@/lib/hooks/use-action";
 import { useResource } from "@/lib/hooks/use-resource";
 
-const loadKeys = () => get<{ keys: SshKey[] }>("/api/keys").then((body) => body.keys);
 
 /** The most keys a member may register (docs/api.md). */
 const keyMaximum = 20;

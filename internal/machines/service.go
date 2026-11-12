@@ -269,6 +269,18 @@ func (s *Service) Create(ctx context.Context, owner string, r Request) (Machine,
 		}
 		return nil
 	}
+	// The member's SSH keys as they are now (later ones are managed inside the machine). Without
+	// keys or a password nothing could sign in to the machine.
+	keys, err := s.store.Keys(ctx, owner)
+	if err != nil {
+		return Machine{}, s.storeError("reading your SSH keys", err)
+	}
+	if len(keys) == 0 && r.PasswordHash == "" {
+		return Machine{}, refuse(http.StatusBadRequest, "Set a password or add an SSH key first: otherwise nothing can sign in to the machine.")
+	}
+	for _, k := range keys {
+		r.AuthorizedKeys = append(r.AuthorizedKeys, k.Line)
+	}
 	var row store.Machine
 	for attempt := 0; ; attempt++ {
 		row = store.Machine{ID: newID(), Owner: owner, Name: r.Name, Image: r.Image.ID, Size: r.Size.ID, CPU: r.Size.CPU, MemoryMiB: r.Size.MemoryMiB, DiskGiB: r.DiskGiB}
@@ -300,14 +312,6 @@ func (s *Service) Create(ctx context.Context, owner string, r Request) (Machine,
 			s.store.DeleteMachine(ctx, row.ID)
 		}
 		return Machine{}, s.kubeError(what, err)
-	}
-	keys, err := s.store.Keys(ctx, owner) // as they are now; later ones are managed inside the machine
-	if err != nil {
-		s.store.DeleteMachine(ctx, row.ID)
-		return Machine{}, s.storeError("reading your SSH keys", err)
-	}
-	for _, k := range keys {
-		r.AuthorizedKeys = append(r.AuthorizedKeys, k.Line)
 	}
 	vm := buildVM(s.Namespace, row.ID, owner, s.Catalog.StorageClass, r)
 	if err := s.write.Create(ctx, vm); err != nil {

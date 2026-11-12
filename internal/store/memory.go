@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -111,6 +112,17 @@ func (m *Memory) Machines(_ context.Context, owner string) ([]Machine, error) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) MachinesNamed(ctx context.Context, owner, name string) ([]Machine, error) {
+	all, _ := m.Machines(ctx, owner)
+	var out []Machine
+	for _, x := range all {
+		if strings.EqualFold(x.Name, name) {
+			out = append(out, x)
+		}
+	}
 	return out, nil
 }
 

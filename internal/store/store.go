@@ -77,6 +77,8 @@ type Store interface {
 	CreateMachine(ctx context.Context, m Machine, check func(Usage) error) error
 	Machine(ctx context.Context, id string) (Machine, error)
 	Machines(ctx context.Context, owner string) ([]Machine, error)
+	// MachinesNamed is the owner's machines whose display name is name, ignoring case.
+	MachinesNamed(ctx context.Context, owner, name string) ([]Machine, error)
 	Usage(ctx context.Context, owner string) (Usage, error)
 	DeleteMachine(ctx context.Context, id string) error
 	// AddKey inserts k if the owner has fewer than max keys; ErrExists if anyone has it.
@@ -243,6 +245,14 @@ func (p *Postgres) Machine(ctx context.Context, id string) (Machine, error) {
 
 func (p *Postgres) Machines(ctx context.Context, owner string) ([]Machine, error) {
 	rows, err := p.pool.Query(ctx, `SELECT `+machineColumns+` FROM machines WHERE owner = $1 ORDER BY created_at DESC`, owner)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Machine, error) { return scanMachine(r) })
+}
+
+func (p *Postgres) MachinesNamed(ctx context.Context, owner, name string) ([]Machine, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+machineColumns+` FROM machines WHERE owner = $1 AND lower(name) = lower($2) ORDER BY created_at DESC`, owner, name)
 	if err != nil {
 		return nil, err
 	}

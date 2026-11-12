@@ -12,6 +12,7 @@ import { ErrorText } from "@/components/ui/error-text";
 import { Icon } from "@/components/ui/icon";
 import { TextInput } from "@/components/ui/text-input";
 import { loadCatalog } from "@/lib/api/catalog";
+import { loadKeys } from "@/lib/api/keys";
 import { post } from "@/lib/api/http";
 import type { Catalog, Machine, NewMachineRequest } from "@/lib/api/types";
 import { formatCpu, formatMemory } from "@/lib/formatting/format";
@@ -66,8 +67,13 @@ const Form = ({ catalog }: { readonly catalog: Catalog }) => {
   // Counted in characters (code points) after trimming, as the server counts them.
   const nameLength = [...name.trim()].length;
   const nameValid = nameLength > 0 && nameLength <= nameMaximum;
+  // The password is optional when the member has an SSH key: then SSH is the way in, and the
+  // console's login prompt can't be passed. Without keys it's the only way in (the server says so too).
+  const keys = useResource(loadKeys);
+  const hasKeys = (keys.data?.length ?? 0) > 0;
   const passwordLength = [...password].length;
-  const passwordValid = passwordLength >= passwordMinimum && passwordLength <= passwordMaximum;
+  const passwordValid =
+    (password === "" && hasKeys) || (passwordLength >= passwordMinimum && passwordLength <= passwordMaximum);
   const matches = password === confirmation;
   const limitProblem =
     machines && chosenSize ? overLimit(catalog, machines, chosenSize.cpu, chosenSize.memoryMiB, diskValid ? diskGiB : 0) : null;
@@ -152,21 +158,33 @@ const Form = ({ catalog }: { readonly catalog: Catalog }) => {
       </section>
       <section className="flex flex-col gap-4 rounded-lg border border-border bg-surface p-4">
         <div className="flex flex-col gap-1">
-          <h2 className="text-[13px] font-medium text-foreground">Console login</h2>
-          <p className="text-xs text-foreground-tertiary">
-            You sign in at the machine&apos;s console as{" "}
-            <span className="font-mono text-foreground-secondary">{chosenImage?.defaultUser ?? "the default user"}</span> with
-            this password. It is stored only as a hash and can&apos;t be shown again.
-          </p>
-          <p className="text-xs text-foreground-tertiary">
-            Your registered{" "}
-            <Link href="/keys/" className="text-foreground-secondary underline-offset-2 hover:underline">
-              SSH keys
-            </Link>{" "}
-            are added to the machine too, for SSH through the jump host.
-          </p>
+          <h2 className="text-[13px] font-medium text-foreground">Signing in</h2>
+          {hasKeys ? (
+            <p className="text-xs text-foreground-tertiary">
+              Your {keys.data?.length === 1 ? "SSH key is" : `${keys.data?.length} SSH keys are`} added to the machine, for
+              SSH through the jump host as{" "}
+              <span className="font-mono text-foreground-secondary">{chosenImage?.defaultUser ?? "the default user"}</span>. A
+              password is optional: set one only if you want to sign in at the browser console too (e.g. if
+              you break the machine&apos;s network).
+            </p>
+          ) : (
+            <p className="text-xs text-foreground-tertiary">
+              You have no{" "}
+              <Link href="/keys/" className="text-foreground-secondary underline-offset-2 hover:underline">
+                SSH keys
+              </Link>{" "}
+              yet, so the password is the only way in: you sign in at the machine&apos;s console as{" "}
+              <span className="font-mono text-foreground-secondary">{chosenImage?.defaultUser ?? "the default user"}</span>.
+              Add a key to use SSH instead.
+            </p>
+          )}
+          <p className="text-xs text-foreground-tertiary">A password is stored only as a hash and can&apos;t be shown again.</p>
         </div>
-        <FormField label="Password" htmlFor="machine-password" hint={`${passwordMinimum}–${passwordMaximum} characters.`}>
+        <FormField
+          label={hasKeys ? "Password (optional)" : "Password"}
+          htmlFor="machine-password"
+          hint={`${passwordMinimum}–${passwordMaximum} characters${hasKeys ? ", or leave empty" : ""}.`}
+        >
           <TextInput
             id="machine-password"
             type="password"

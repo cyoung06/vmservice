@@ -123,6 +123,14 @@ type Tab = "overview" | "console";
 
 const Overview = ({ machine }: { readonly machine: Machine }) => {
   const { configuration } = useSession();
+  // ssh -J … user@<name> works when the name can be a host name and no other of the member's
+  // machines has it (the bastion's rule).
+  const { machines: mine } = useMachines();
+  const sshName =
+    /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(machine.name) &&
+    (mine ?? []).filter((other) => other.name.toLowerCase() === machine.name.toLowerCase()).length === 1
+      ? machine.name
+      : null;
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-[1080px] flex-col gap-8 px-4 py-5 md:px-8 md:py-6">
@@ -142,7 +150,7 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
           <div className="flex flex-col gap-3 text-xs text-foreground-tertiary">
             <p>
               On the console, sign in as <span className="font-mono text-foreground-secondary">{machine.defaultUser}</span>{" "}
-              with the password you set when you made the machine.
+              with the password you set when you made the machine, if you set one.
             </p>
             {configuration.ssh ? (
               <div className="flex flex-col gap-1.5">
@@ -154,6 +162,7 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
                   before the machine was made:
                 </p>
                 <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser, machine.id)} />
+                {sshName ? <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser, sshName)} /> : null}
               </div>
             ) : null}
           </div>

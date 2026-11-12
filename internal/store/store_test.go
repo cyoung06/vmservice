@@ -74,6 +74,12 @@ func TestMachines(t *testing.T) {
 			if u, _ := s.Usage(ctx, "alice"); u != (Usage{VMs: 1, CPU: 2, MemoryMiB: 2048, DiskGiB: 20}) {
 				t.Errorf("usage = %+v", u)
 			}
+			if named, _ := s.MachinesNamed(ctx, "alice", "BOX"); len(named) != 1 || named[0].ID != "vm-aaaaaa" {
+				t.Errorf("named BOX = %+v", named)
+			}
+			if named, _ := s.MachinesNamed(ctx, "bob", "box"); len(named) != 0 {
+				t.Errorf("bob finds alice's box: %+v", named)
+			}
 			if list, _ := s.Machines(ctx, "bob"); len(list) != 0 {
 				t.Errorf("bob sees %v", list)
 			}
