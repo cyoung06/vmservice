@@ -35,11 +35,15 @@ It is a Next.js static export served by a small Go binary, on its own origin.
   the member deletes it), never a VM nobody owns.
 - **Limits** are per member (machines, vCPUs, memory, disk) and checked in one SERIALIZABLE
   transaction with the insert, so they hold however many requests arrive at once.
-- **Open streams** (live views, consoles and bastion sessions) are capped per member (`-max-streams`).
+- **Open streams** (live views and consoles) are capped per member (`-max-streams`).
 - **SSH keys** are registered in the portal (one member per key) and go into each machine created
   afterwards (cloud-init `ssh_authorized_keys`).
-- **The SSH bastion** (optional, `-ssh-listen`): `ssh -J host:port user@vm-xxxxxx`. The key says who
-  you are; the only thing allowed is forwarding to port 22 of a running machine of yours.
+- **The SSH bastion** is a separate process, `vmservice bastion`, so the public SSH port sits behind
+  its own boundary: `ssh -J host:port user@vm-xxxxxx`. The key says who you are; the only thing
+  allowed is forwarding to port 22 of a running machine of yours, for as long as a sign-in lasts
+  after your last one. It can change nothing: its database role only reads members, machines and
+  keys (the portal grants that at start, `-bastion-db-role`), and its service account only reads
+  VirtualMachineInstances.
 - **Live state** comes from an informer on the namespace's VMs and DataVolumes, and reaches the
   browser as server-sent events (`/api/vms/events`). There is no polling.
 - **Consoles**: the browser's websocket is passed through to KubeVirt's VMI `console` and `vnc`
@@ -74,10 +78,13 @@ vmservice -namespace vms -catalog /etc/vmservice/catalog.yaml -origin https://vm
 | `-session-key-file` | (required) | 32 bytes, raw or base64 |
 | `-database-url-file` | (required) | a file holding the Postgres URL; the schema is migrated at start |
 | `-session-lifetime` | `168h` | how long a sign-in lasts |
-| `-max-streams` | `8` | open consoles, live views and bastion sessions per member, together |
-| `-ssh-listen` | | the bastion's listen address, e.g. `:2222`; empty: no bastion |
-| `-ssh-host-key-file` | | the bastion's host key (OpenSSH private key file) |
-| `-ssh-public` | `-origin`'s host, `-ssh-listen`'s port | the bastion's `host:port` as members reach it (shown in the UI) |
+| `-max-streams` | `8` | open consoles and live views per member, together |
+| `-ssh-public` | | the bastion's `host:port` as members reach it, shown in the UI; empty: none |
+| `-bastion-db-role` | | the bastion's database role, granted read on members, machines and ssh_keys at every start |
+
+`vmservice bastion` takes `-namespace`, `-database-url-file` (its read-only role), `-listen`
+(`:2222`), `-host-key-file` (an OpenSSH private key), `-session-lifetime` (the portal's) and
+`-max-sessions` (`8` per member).
 | `-title` | `VMService` | sidebar and tab title |
 | `-login-provider` | | name on the button ("Sign in with …") |
 

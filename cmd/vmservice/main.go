@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -34,28 +33,14 @@ import (
 
 var version = "dev"
 
-// publicSSH is the bastion's public host and port: -ssh-public, or the origin's host with the
-// listen port.
-func publicSSH(public, origin, listen string) (*web.SSH, error) {
-	host, port := public, ""
-	if public != "" {
-		h, p, err := net.SplitHostPort(public)
-		if err != nil {
-			return nil, err
-		}
-		host, port = h, p
-	} else {
-		u, err := url.Parse(origin)
-		if err != nil {
-			return nil, err
-		}
-		host = u.Hostname()
-		if _, p, err := net.SplitHostPort(listen); err == nil {
-			port = p
-		}
+// publicSSH parses -ssh-public (host:port); empty: no bastion is advertised.
+func publicSSH(public string) (*web.SSH, error) {
+	if public == "" {
+		return nil, nil
 	}
-	n, err := strconv.Atoi(port)
-	if err != nil || n < 1 || n > 65535 || host == "" {
+	host, port, err := net.SplitHostPort(public)
+	n, perr := strconv.Atoi(port)
+	if err != nil || perr != nil || n < 1 || n > 65535 || host == "" {
 		return nil, fmt.Errorf("need host:port, got %q", public)
 	}
 	return &web.SSH{Host: host, Port: n}, nil
@@ -63,6 +48,9 @@ func publicSSH(public, origin, listen string) (*web.SSH, error) {
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	if len(os.Args) > 1 && os.Args[1] == "bastion" {
+		os.Exit(runBastion(log, os.Args[2:]))
+	}
 	var a auth.Config
 	var ui web.Config
 	listen := flag.String("listen", ":8080", "listen address (plain HTTP; TLS terminates in front)")
@@ -78,10 +66,9 @@ func main() {
 	flag.StringVar(&a.UsernameClaim, "username-claim", "preferred_username", "the ID token claim with the username")
 	flag.StringVar(&a.KeyFile, "session-key-file", "", "file holding the 32-byte session cookie key, raw or base64 (required)")
 	flag.DurationVar(&a.Lifetime, "session-lifetime", 7*24*time.Hour, "how long a sign-in lasts; also how long a removed member keeps access")
-	maxStreams := flag.Int("max-streams", 8, "open consoles, live views and SSH sessions per member, together")
-	sshListen := flag.String("ssh-listen", "", "the SSH bastion's listen address, e.g. :2222 (empty: no bastion)")
-	sshHostKey := flag.String("ssh-host-key-file", "", "the bastion's host key, an OpenSSH private key file (required with -ssh-listen)")
-	sshPublic := flag.String("ssh-public", "", "the bastion's address as members reach it, host:port (default: -origin's host and -ssh-listen's port)")
+	maxStreams := flag.Int("max-streams", 8, "open consoles and live views per member, together")
+	sshPublic := flag.String("ssh-public", "", "the bastion's address as members reach it, host:port, shown in the UI (empty: none); the bastion itself is \"vmservice bastion\"")
+	bastionRole := flag.String("bastion-db-role", "", "a database role the bastion runs as: granted read on members, machines and ssh_keys at every start (empty: none)")
 	flag.StringVar(&ui.Title, "title", "VMService", "name shown in the sidebar and the tab title")
 	flag.StringVar(&ui.LoginProvider, "login-provider", "", "the sign-in provider's name for the button, e.g. \"Keycloak\" (empty: \"Sign in\")")
 	flag.Parse()
@@ -135,37 +122,21 @@ func main() {
 		log.Error("machines", "err", err)
 		os.Exit(1)
 	}
-	vms.SignInValid = a.Lifetime // the bastion honours keys as long as a sign-in lasts
 	proxy, err := console.New(kube, machines.APIServer(kube))
 	if err != nil {
 		log.Error("console", "err", err)
 		os.Exit(1)
 	}
 	streams := &limit.PerOwner{Max: int64(*maxStreams)}
-	if *sshListen != "" {
-		pub, err := publicSSH(*sshPublic, a.Origin, *sshListen)
-		if err != nil {
-			log.Error("-ssh-public", "err", err)
-			os.Exit(2)
-		}
-		ui.SSH = pub
-		b, err := bastion.New(*sshHostKey, vms, streams, log)
-		if err != nil {
-			log.Error("bastion", "err", err)
+	if ui.SSH, err = publicSSH(*sshPublic); err != nil {
+		log.Error("-ssh-public", "err", err)
+		os.Exit(2)
+	}
+	if *bastionRole != "" {
+		if err := db.GrantRead(ctx, *bastionRole); err != nil {
+			log.Error("granting the bastion's role", "role", *bastionRole, "err", err)
 			os.Exit(1)
 		}
-		l, err := net.Listen("tcp", *sshListen)
-		if err != nil {
-			log.Error("bastion", "err", err)
-			os.Exit(1)
-		}
-		go func() {
-			if err := b.Serve(ctx, l); err != nil {
-				log.Error("bastion", "err", err)
-				os.Exit(1)
-			}
-		}()
-		log.Info("bastion listening", "addr", *sshListen, "public", fmt.Sprintf("%s:%d", pub.Host, pub.Port))
 	}
 	h, err := web.Handler(web.UI(), ui, a.Origin, signIn.Routes, api.New(signIn, vms, proxy, a.Origin, streams, log).Routes)
 	if err != nil {
@@ -180,4 +151,62 @@ func main() {
 		log.Error("serve", "err", err)
 		os.Exit(1)
 	}
+}
+
+// runBastion is "vmservice bastion": the SSH jump host, in a process of its own with only read
+// access (its database role can only read; its service account only reads VirtualMachineInstances).
+func runBastion(log *slog.Logger, args []string) int {
+	fs := flag.NewFlagSet("bastion", flag.ExitOnError)
+	namespace := fs.String("namespace", "", "the machines' namespace (required)")
+	databaseURLFile := fs.String("database-url-file", "", "file holding the Postgres URL of a role that may read members, machines and ssh_keys (required)")
+	listen := fs.String("listen", ":2222", "the SSH listen address")
+	hostKey := fs.String("host-key-file", "", "the host key, an OpenSSH private key file (required)")
+	lifetime := fs.Duration("session-lifetime", 7*24*time.Hour, "how long after a member's last sign-in their keys are honoured: the portal's -session-lifetime")
+	maxSessions := fs.Int("max-sessions", 8, "open SSH sessions per member")
+	fs.Parse(args)
+	for name, v := range map[string]string{"namespace": *namespace, "database-url-file": *databaseURLFile, "host-key-file": *hostKey} {
+		if v == "" {
+			log.Error("-" + name + " is required")
+			return 2
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	dbURL, err := os.ReadFile(*databaseURLFile)
+	if err != nil {
+		log.Error("database url", "err", err)
+		return 1
+	}
+	db, err := store.OpenReadOnly(ctx, strings.TrimSpace(string(dbURL)))
+	if err != nil {
+		log.Error("database", "err", err)
+		return 1
+	}
+	defer db.Close()
+	kube, err := ctrlconfig.GetConfig()
+	if err != nil {
+		log.Error("kubernetes config", "err", err)
+		return 1
+	}
+	lookup, err := machines.NewLookup(ctx, kube, *namespace, db, *lifetime, log)
+	if err != nil {
+		log.Error("lookup", "err", err)
+		return 1
+	}
+	b, err := bastion.New(*hostKey, lookup, &limit.PerOwner{Max: int64(*maxSessions)}, log)
+	if err != nil {
+		log.Error("bastion", "err", err)
+		return 1
+	}
+	l, err := net.Listen("tcp", *listen)
+	if err != nil {
+		log.Error("bastion", "err", err)
+		return 1
+	}
+	log.Info("bastion listening", "addr", *listen, "version", version, "namespace", *namespace)
+	if err := b.Serve(ctx, l); err != nil {
+		log.Error("bastion", "err", err)
+		return 1
+	}
+	return 0
 }

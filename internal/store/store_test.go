@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	neturl "net/url"
 	"os"
 	"sync"
 	"testing"
@@ -140,5 +141,48 @@ func TestKeys(t *testing.T) {
 				t.Errorf("keys = %+v", keys)
 			}
 		})
+	}
+}
+
+// The bastion's role reads members, machines and keys, and can change nothing.
+func TestReadOnlyRole(t *testing.T) {
+	url := os.Getenv("VMSERVICE_TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("needs VMSERVICE_TEST_DATABASE_URL")
+	}
+	ctx := context.Background()
+	stores(t) // fresh schema
+	owner, err := Open(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	owner.pool.Exec(ctx, `DROP ROLE IF EXISTS bastion_test`)
+	if _, err := owner.pool.Exec(ctx, `CREATE ROLE bastion_test LOGIN PASSWORD 'pw'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.GrantRead(ctx, "bastion_test"); err != nil {
+		t.Fatal(err)
+	}
+	owner.UpsertMember(ctx, "alice", "alice")
+	owner.AddKey(ctx, Key{ID: "k1", Owner: "alice", Line: "ssh-ed25519 AAAA"}, 20)
+	u, _ := neturl.Parse(url)
+	u.User = neturl.UserPassword("bastion_test", "pw")
+	ro, err := OpenReadOnly(ctx, u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if k, err := ro.Key(ctx, "k1"); err != nil || k.Owner != "alice" {
+		t.Errorf("read as bastion = %+v, %v", k, err)
+	}
+	if _, err := ro.SignedInAt(ctx, "alice"); err != nil {
+		t.Errorf("sign-in time as bastion: %v", err)
+	}
+	if err := ro.AddKey(ctx, Key{ID: "k2", Owner: "alice", Line: "x"}, 20); err == nil {
+		t.Error("the bastion's role could add a key")
+	}
+	if err := ro.DeleteKey(ctx, "alice", "k1"); err == nil {
+		t.Error("the bastion's role could delete a key")
 	}
 }

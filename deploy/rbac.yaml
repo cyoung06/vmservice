@@ -15,9 +15,6 @@ rules:
   - apiGroups: [kubevirt.io]
     resources: [virtualmachines]
     verbs: [get, list, watch, create, delete]
-  - apiGroups: [kubevirt.io]
-    resources: [virtualmachineinstances]
-    verbs: [get, list, watch]        # state and addresses (the bastion forwards to them)
   - apiGroups: [subresources.kubevirt.io]
     resources: [virtualmachines/start, virtualmachines/stop, virtualmachines/restart]
     verbs: [update]
@@ -46,4 +43,35 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: vmservice
+    namespace: vms
+---
+# The bastion ("vmservice bastion"): reads where running machines are, nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vmservice-bastion
+  namespace: vms
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vmservice-bastion
+  namespace: vms
+rules:
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachineinstances]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vmservice-bastion
+  namespace: vms
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vmservice-bastion
+subjects:
+  - kind: ServiceAccount
+    name: vmservice-bastion
     namespace: vms

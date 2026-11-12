@@ -61,16 +61,13 @@ type Service struct {
 	read      client.Reader // the informer cache
 	write     client.Client // straight to the API server
 	store     store.Store
-	// SignInValid is how long after a member's last sign-in the bastion honours their keys (the
-	// session lifetime): removing someone from the group then reaches SSH as late as the portal.
-	SignInValid time.Duration
-	http        *http.Client
-	hub         *hub
-	log         *slog.Logger
+	http      *http.Client
+	hub       *hub
+	log       *slog.Logger
 }
 
-// New connects to the cluster and starts the cache of the namespace's VirtualMachines, their
-// instances and DataVolumes. It returns once the cache has synced.
+// New connects to the cluster and starts the cache of the namespace's VirtualMachines and
+// DataVolumes. It returns once the cache has synced.
 func New(ctx context.Context, cfg *rest.Config, namespace string, catalog *config.Catalog, st store.Store, log *slog.Logger) (*Service, error) {
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, kubevirtv1.AddToScheme, cdiv1.AddToScheme} {
@@ -102,10 +99,6 @@ func New(ctx context.Context, cfg *rest.Config, namespace string, catalog *confi
 		UpdateFunc: func(_, o any) { s.changed(o) },
 		DeleteFunc: s.vmGone,
 	}); err != nil {
-		return nil, err
-	}
-	// The bastion looks up instances for their addresses.
-	if _, err := c.GetInformer(ctx, &kubevirtv1.VirtualMachineInstance{}); err != nil {
 		return nil, err
 	}
 	disks, err := c.GetInformer(ctx, &cdiv1.DataVolume{})

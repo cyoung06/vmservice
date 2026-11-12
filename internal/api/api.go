@@ -36,7 +36,7 @@ func New(a *auth.Auth, m *machines.Service, c *console.Proxy, origin string, str
 }
 
 func (a *API) tooMany(w http.ResponseWriter) {
-	reply(w, http.StatusTooManyRequests, detail(fmt.Sprintf("You have %d consoles, live views and SSH sessions open; close some first.", a.streams.Max)))
+	reply(w, http.StatusTooManyRequests, detail(fmt.Sprintf("You have %d consoles and live views open; close some first.", a.streams.Max)))
 }
 
 // Routes adds the API's endpoints to mux.

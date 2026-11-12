@@ -65,18 +65,18 @@ func TestKeys(t *testing.T) {
 	}
 	// A member who hasn't signed in within the session lifetime: their keys stop working.
 	s.store.(*store.Memory).SetSignedIn("alice", time.Now().Add(-2*time.Hour))
-	if _, _, ok := s.KeyOwner(ctx, pk); ok {
+	if _, _, ok := lookupFor(s).KeyOwner(ctx, pk); ok {
 		t.Error("a key was honoured long after its owner's last sign-in")
 	}
 	s.store.(*store.Memory).SetSignedIn("alice", time.Now())
 	if _, err := s.AddKey(ctx, "bob", line, "mine now"); status(err) != http.StatusConflict {
 		t.Errorf("bob registering alice's key = %v, want 409", err)
 	}
-	if owner, until, ok := s.KeyOwner(ctx, pk); !ok || owner != "alice" || time.Until(until) < 50*time.Minute {
+	if owner, until, ok := lookupFor(s).KeyOwner(ctx, pk); !ok || owner != "alice" || time.Until(until) < 50*time.Minute {
 		t.Errorf("owner = %q %v", owner, ok)
 	}
 	_, other := newKeyLine(t, "")
-	if _, _, ok := s.KeyOwner(ctx, other); ok {
+	if _, _, ok := lookupFor(s).KeyOwner(ctx, other); ok {
 		t.Error("an unregistered key has an owner")
 	}
 	if err := s.DeleteKey(ctx, "bob", k.ID); status(err) != http.StatusNotFound {
@@ -88,7 +88,7 @@ func TestKeys(t *testing.T) {
 	if err := s.DeleteKey(ctx, "alice", k.ID); err != nil {
 		t.Errorf("alice delete = %v", err)
 	}
-	if _, _, ok := s.KeyOwner(ctx, pk); ok {
+	if _, _, ok := lookupFor(s).KeyOwner(ctx, pk); ok {
 		t.Error("a deleted key still has an owner")
 	}
 }
@@ -143,5 +143,28 @@ func TestLongLabel(t *testing.T) {
 	line2, _ := newKeyLine(t, "")
 	if _, err := s.AddKey(context.Background(), "alice", line2, strings.Repeat("x", 64)); status(err) != http.StatusBadRequest {
 		t.Errorf("a 64-character label = %v, want 400", err)
+	}
+}
+
+func lookupFor(s *Service) *Lookup {
+	return &Lookup{Namespace: s.Namespace, SignInValid: time.Hour, store: s.store, read: s.read}
+}
+
+// The bastion's address lookup: only the owner's machine, only by a well-formed id.
+func TestLookupAddress(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	m, err := s.Create(ctx, "alice", request(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := lookupFor(s)
+	for _, c := range []struct{ owner, id string }{{"bob", m.ID}, {"alice", "a/../../secrets"}, {"alice", "vm-zzzzzz"}} {
+		if _, err := l.Address(ctx, c.owner, c.id); err != ErrNotFound {
+			t.Errorf("Address(%s, %q) = %v, want not found", c.owner, c.id, err)
+		}
+	}
+	if _, err := l.Address(ctx, "alice", m.ID); status(err) != http.StatusConflict {
+		t.Errorf("Address of a machine with no running instance = %v, want 409", err)
 	}
 }

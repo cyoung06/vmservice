@@ -106,6 +106,27 @@ func Open(ctx context.Context, url string) (*Postgres, error) {
 	return p, nil
 }
 
+// OpenReadOnly connects without touching the schema, for a process whose role may only read
+// (the bastion).
+func OpenReadOnly(ctx context.Context, url string) (*Postgres, error) {
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return &Postgres{pool}, nil
+}
+
+// GrantRead lets role read what the bastion needs (members, machines, ssh_keys) and nothing else.
+// Run by the owner at every start, so it holds whichever was created first.
+func (p *Postgres) GrantRead(ctx context.Context, role string) error {
+	_, err := p.pool.Exec(ctx, `GRANT SELECT ON members, machines, ssh_keys TO `+pgx.Identifier{role}.Sanitize())
+	return err
+}
+
 // Close closes the pool.
 func (p *Postgres) Close() { p.pool.Close() }
 

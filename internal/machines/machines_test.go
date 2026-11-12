@@ -64,7 +64,7 @@ func testService(t *testing.T) (*Service, *[]string) {
 	st.UpsertMember(ctx, "bob", "bob")
 	s := &Service{
 		Namespace: "cloud", Catalog: catalog, Config: &rest.Config{Host: srv.URL},
-		read: c, write: c, store: st, SignInValid: time.Hour, http: srv.Client(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		read: c, write: c, store: st, http: srv.Client(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	s.hub = newHub(ctx, s.render)
 	return s, calls

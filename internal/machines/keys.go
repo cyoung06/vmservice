@@ -13,8 +13,6 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
-	kubevirtv1 "kubevirt.io/api/core/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/cyoung06/vmservice/internal/store"
 )
@@ -144,43 +142,4 @@ func (s *Service) DeleteKey(ctx context.Context, owner, id string) error {
 	}
 	s.log.Info("ssh key deleted", "owner", owner, "id", id)
 	return nil
-}
-
-// KeyOwner is the owner of a public key, for the bastion: false if nobody registered it (or the
-// stored key isn't exactly this one).
-//
-// The key is honoured until the owner's last sign-in plus SignInValid, like a portal session, so
-// removing someone from the group reaches SSH no later than the portal.
-func (s *Service) KeyOwner(ctx context.Context, pk ssh.PublicKey) (string, time.Time, bool) {
-	k, err := s.store.Key(ctx, KeyID(pk))
-	if err != nil {
-		return "", time.Time{}, false
-	}
-	stored, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k.Line))
-	if err != nil || string(stored.Marshal()) != string(pk.Marshal()) || k.Owner == "" {
-		return "", time.Time{}, false
-	}
-	at, err := s.store.SignedInAt(ctx, k.Owner)
-	until := at.Add(s.SignInValid)
-	if err != nil || !time.Now().Before(until) {
-		return "", time.Time{}, false
-	}
-	return k.Owner, until, true
-}
-
-// Address is the pod-network address of the owner's running machine id, for the bastion.
-func (s *Service) Address(ctx context.Context, owner, id string) (string, error) {
-	if _, _, err := s.get(ctx, owner, id); err != nil {
-		return "", err
-	}
-	var vmi kubevirtv1.VirtualMachineInstance
-	if err := s.read.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: id}, &vmi); err != nil || vmi.Status.Phase != kubevirtv1.Running {
-		return "", refuse(http.StatusConflict, "The machine isn't running.")
-	}
-	for _, iface := range vmi.Status.Interfaces {
-		if iface.Name == "default" && iface.IP != "" {
-			return iface.IP, nil
-		}
-	}
-	return "", refuse(http.StatusConflict, "The machine has no address yet.")
 }
