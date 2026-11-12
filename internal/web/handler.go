@@ -99,7 +99,13 @@ func Handler(files fs.FS, cfg Config, origin string, routes ...func(*http.ServeM
 		w.Header().Set("Cache-Control", "no-store")
 		w.Write(config)
 	})
-	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+	// Every method, so it doesn't conflict with the API's own catch-all ("/api/"); pages are GET only.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		name := strings.TrimPrefix(path.Clean(r.URL.Path), "/")
 		if name == "" || strings.HasSuffix(r.URL.Path, "/") {
 			name = path.Join(name, "index.html")

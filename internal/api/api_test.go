@@ -10,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/cyoung06/vmservice/internal/auth"
+	"github.com/cyoung06/vmservice/internal/web"
 )
 
 // testAPI is the API with sign-in against a fake provider (discovery only) and no machines: these
@@ -36,10 +38,14 @@ func testAPI(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	a.Routes(mux)
-	New(a, nil, nil, "https://vm.example.org", 8, log).Routes(mux)
-	return mux
+	// The whole server as main wires it: the UI, sign-in and the API on one mux (registering
+	// conflicting patterns panics here).
+	h, err := web.Handler(fstest.MapFS{"404.html": {Data: []byte("missing")}}, web.Config{}, "https://vm.example.org",
+		a.Routes, New(a, nil, nil, "https://vm.example.org", 8, log).Routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 func TestGuards(t *testing.T) {
@@ -59,6 +65,9 @@ func TestGuards(t *testing.T) {
 		{"DELETE", "/api/vms/vm-a", map[string]string{"X-Requested-With": "XMLHttpRequest", "Origin": "https://vm.example.org"}, http.StatusUnauthorized},
 		{"POST", "/auth/logout", nil, http.StatusForbidden},
 		{"GET", "/api/nothing", nil, http.StatusNotFound},
+		{"POST", "/api/nothing", nil, http.StatusNotFound},
+		{"POST", "/somewhere", nil, http.StatusMethodNotAllowed},
+		{"GET", "/healthz", nil, http.StatusOK},
 	} {
 		r := httptest.NewRequest(c.method, c.path, nil)
 		for k, v := range c.headers {
