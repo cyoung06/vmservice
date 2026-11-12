@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	kubevirtv1 "kubevirt.io/api/core/v1"
@@ -19,20 +19,17 @@ import (
 	"github.com/cyoung06/vmservice/internal/store"
 )
 
-// Lookup is the read-only view the SSH bastion runs on, in a process of its own: who owns a key,
-// whose a machine is (both from the store, which it may only read), and where a running machine is
-// (its VirtualMachineInstance, the only Kubernetes object it may read). It can't change anything.
+// Lookup is the read-only view the SSH bastion runs on, in a process of its own: which machine a
+// name means (from the store, which it may only read) and where a running machine is (its
+// VirtualMachineInstance, the only Kubernetes object it may read). It can't change anything.
 type Lookup struct {
 	Namespace string
-	// SignInValid is how long after a member's last sign-in their keys are honoured (the session
-	// lifetime): removing someone from the group reaches SSH no later than the portal.
-	SignInValid time.Duration
-	store       store.Store
-	read        client.Reader
+	store     store.Store
+	read      client.Reader
 }
 
 // NewLookup starts a cache of the namespace's VirtualMachineInstances and returns once it synced.
-func NewLookup(ctx context.Context, cfg *rest.Config, namespace string, st store.Store, signInValid time.Duration, log *slog.Logger) (*Lookup, error) {
+func NewLookup(ctx context.Context, cfg *rest.Config, namespace string, st store.Store, log *slog.Logger) (*Lookup, error) {
 	scheme := runtime.NewScheme()
 	if err := kubevirtv1.AddToScheme(scheme); err != nil {
 		return nil, err
@@ -54,62 +51,27 @@ func NewLookup(ctx context.Context, cfg *rest.Config, namespace string, st store
 	if !c.WaitForCacheSync(syncCtx) {
 		return nil, fmt.Errorf("the cache of %s didn't sync (may the service account list VirtualMachineInstances?)", namespace)
 	}
-	return &Lookup{Namespace: namespace, SignInValid: signInValid, store: st, read: c}, nil
+	return &Lookup{Namespace: namespace, store: st, read: c}, nil
 }
 
-// KeyOwner is the owner of a public key and until when it's honoured: the owner's last sign-in plus
-// SignInValid, like a portal session. false if nobody registered it, the stored key isn't exactly
-// this one, or the owner hasn't signed in within SignInValid.
-func (l *Lookup) KeyOwner(ctx context.Context, pk ssh.PublicKey) (string, time.Time, bool) {
-	k, err := l.store.Key(ctx, KeyID(pk))
-	if err != nil {
-		return "", time.Time{}, false
-	}
-	stored, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k.Line))
-	if err != nil || string(stored.Marshal()) != string(pk.Marshal()) || k.Owner == "" {
-		return "", time.Time{}, false
-	}
-	at, err := l.store.SignedInAt(ctx, k.Owner)
-	until := at.Add(l.SignInValid)
-	if err != nil || !time.Now().Before(until) {
-		return "", time.Time{}, false
-	}
-	return k.Owner, until, true
-}
-
-// hostName is a display name that can be typed as an SSH host name.
-var hostName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
-
-// machineFor finds the owner's machine for a host typed after ssh -J: its id, or the display name of
-// exactly one of the owner's machines (ignoring case). Only the owner's own machines are searched.
-func (l *Lookup) machineFor(ctx context.Context, owner, host string) (store.Machine, error) {
-	if idFormat.MatchString(host) {
-		row, err := l.store.Machine(ctx, host)
-		if errors.Is(err, store.ErrNotFound) || (err == nil && row.Owner != owner) {
-			return store.Machine{}, ErrNotFound
-		}
-		return row, err
-	}
-	if !hostName.MatchString(host) {
-		return store.Machine{}, ErrNotFound
-	}
-	rows, err := l.store.MachinesNamed(ctx, owner, host)
+// Address is the pod-network address of a running machine, by its name (a hostname, unique across
+// everyone) or its id. The bastion is open to anyone: the machine's own sshd signs people in.
+func (l *Lookup) Address(ctx context.Context, host string) (string, error) {
+	var row store.Machine
+	var err error
 	switch {
-	case err != nil:
-		return store.Machine{}, err
-	case len(rows) == 0:
-		return store.Machine{}, ErrNotFound
-	case len(rows) > 1:
-		return store.Machine{}, refuse(http.StatusConflict, "%d of your machines are named %q; use the machine id (vm-…)", len(rows), host)
+	case idFormat.MatchString(host):
+		row, err = l.store.Machine(ctx, host)
+	case hostName.MatchString(host):
+		row, err = l.store.MachineByName(ctx, strings.ToLower(host))
+	default:
+		return "", ErrNotFound
 	}
-	return rows[0], nil
-}
-
-// Address is the pod-network address of the owner's running machine, by id or by name.
-func (l *Lookup) Address(ctx context.Context, owner, host string) (string, error) {
-	row, err := l.machineFor(ctx, owner, host)
+	if errors.Is(err, store.ErrNotFound) {
+		return "", ErrNotFound
+	}
 	if err != nil {
-		return "", err // refusals are shown to the member; anything else the bastion keeps generic
+		return "", err // internal: the bastion shows a generic message
 	}
 	id := row.ID
 	var vmi kubevirtv1.VirtualMachineInstance
@@ -123,3 +85,6 @@ func (l *Lookup) Address(ctx context.Context, owner, host string) (string, error
 	}
 	return "", refuse(http.StatusConflict, "The machine has no address yet.")
 }
+
+// hostName is a host typed after ssh -J that could be a machine name.
+var hostName = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)

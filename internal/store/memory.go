@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -15,6 +14,8 @@ type Memory struct {
 	mu       sync.Mutex
 	members  map[string]string
 	signedIn map[string]time.Time
+	uids     map[string]*int
+	quotas   map[string]Quota
 	machines map[string]Machine
 	keys     map[string]Key
 	media    map[string]Medium
@@ -23,7 +24,7 @@ type Memory struct {
 
 // NewMemory is an empty Memory store.
 func NewMemory() *Memory {
-	return &Memory{members: map[string]string{}, signedIn: map[string]time.Time{}, machines: map[string]Machine{}, keys: map[string]Key{}, media: map[string]Medium{}, clock: time.Unix(1_800_000_000, 0)}
+	return &Memory{members: map[string]string{}, signedIn: map[string]time.Time{}, uids: map[string]*int{}, quotas: map[string]Quota{}, machines: map[string]Machine{}, keys: map[string]Key{}, media: map[string]Medium{}, clock: time.Unix(1_800_000_000, 0)}
 }
 
 func (m *Memory) now() time.Time { m.clock = m.clock.Add(time.Second); return m.clock }
@@ -76,19 +77,25 @@ func (m *Memory) usage(owner string) Usage {
 	return u
 }
 
-func (m *Memory) CreateMachine(_ context.Context, x Machine, check func(Usage) error) error {
+func (m *Memory) CreateMachine(_ context.Context, x Machine, check func(Usage, Quota) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.members[x.Owner]; !ok {
 		return fmt.Errorf("owner %q isn't a member (foreign key)", x.Owner)
 	}
-	if err := check(m.usage(x.Owner)); err != nil {
+	if err := check(m.usage(x.Owner), m.quotas[x.Owner]); err != nil {
 		return err
 	}
 	if _, ok := m.machines[x.ID]; ok {
 		return ErrExists
 	}
+	for _, o := range m.machines {
+		if o.Name == x.Name {
+			return ErrExists
+		}
+	}
 	x.CreatedAt = m.now()
+	x.OwnerName = m.members[x.Owner]
 	m.machines[x.ID] = x
 	return nil
 }
@@ -113,17 +120,6 @@ func (m *Memory) Machines(_ context.Context, owner string) ([]Machine, error) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
-	return out, nil
-}
-
-func (m *Memory) MachinesNamed(ctx context.Context, owner, name string) ([]Machine, error) {
-	all, _ := m.Machines(ctx, owner)
-	var out []Machine
-	for _, x := range all {
-		if strings.EqualFold(x.Name, name) {
-			out = append(out, x)
-		}
-	}
 	return out, nil
 }
 
@@ -217,6 +213,7 @@ func (m *Memory) Medium(_ context.Context, id string) (Medium, error) {
 	if !ok {
 		return Medium{}, ErrNotFound
 	}
+	x.OwnerName = m.members[x.Owner]
 	return x, nil
 }
 
@@ -249,5 +246,111 @@ func (m *Memory) DeleteMedium(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.media, id)
+	return nil
+}
+
+func (m *Memory) MachineByName(_ context.Context, name string) (Machine, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, x := range m.machines {
+		if x.Name == name {
+			return x, nil
+		}
+	}
+	return Machine{}, ErrNotFound
+}
+
+func (m *Memory) AllMachines(_ context.Context) ([]Machine, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Machine
+	for _, x := range m.machines {
+		out = append(out, x)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) member(owner string) Member {
+	return Member{Owner: owner, Username: m.members[owner], UID: m.uids[owner], Quota: m.quotas[owner], SignedInAt: m.signedIn[owner]}
+}
+
+func (m *Memory) Member(_ context.Context, owner string) (Member, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.members[owner]; !ok {
+		return Member{}, ErrNotFound
+	}
+	return m.member(owner), nil
+}
+
+func (m *Memory) Members(_ context.Context) ([]Member, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Member
+	for owner := range m.members {
+		out = append(out, m.member(owner))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Username < out[j].Username })
+	return out, nil
+}
+
+func (m *Memory) SetUID(_ context.Context, owner string, uid *int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.uids[owner] = uid
+	return nil
+}
+
+func (m *Memory) SetQuota(_ context.Context, owner string, q Quota) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.members[owner]; !ok {
+		return ErrNotFound
+	}
+	m.quotas[owner] = q
+	return nil
+}
+
+func (m *Memory) PublicMedia(ctx context.Context) ([]Medium, error) {
+	all, _ := m.AllMedia(ctx)
+	var out []Medium
+	for _, x := range all {
+		if x.Public {
+			out = append(out, x)
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) AllMedia(_ context.Context) ([]Medium, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Medium
+	for _, x := range m.media {
+		x.OwnerName = m.members[x.Owner]
+		out = append(out, x)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) UpdateMedium(_ context.Context, id string, u MediumUpdate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	x, ok := m.media[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if u.Name != nil {
+		x.Name = *u.Name
+	}
+	if u.Public != nil {
+		x.Public = *u.Public
+	}
+	if u.CloudConfig != nil {
+		x.CloudConfig = u.CloudConfig
+	}
+	m.media[id] = x
 	return nil
 }

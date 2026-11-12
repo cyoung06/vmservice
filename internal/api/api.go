@@ -14,10 +14,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/cyoung06/vmservice/internal/auth"
-	"github.com/cyoung06/vmservice/internal/config"
 	"github.com/cyoung06/vmservice/internal/console"
 	"github.com/cyoung06/vmservice/internal/limit"
 	"github.com/cyoung06/vmservice/internal/machines"
+	"github.com/cyoung06/vmservice/internal/store"
 )
 
 // API serves /api/.
@@ -44,25 +44,38 @@ func (a *API) tooMany(w http.ResponseWriter) {
 func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/session", a.read(a.session))
 	mux.HandleFunc("GET /api/catalog", a.read(a.catalog))
+	mux.HandleFunc("GET /api/names/{name}", a.read(a.nameAvailable))
 	mux.HandleFunc("GET /api/vms", a.read(a.list))
 	mux.HandleFunc("GET /api/vms/events", a.events)
 	mux.HandleFunc("GET /api/vms/{id}", a.read(a.get))
 	mux.HandleFunc("POST /api/vms", a.write(a.create))
 	mux.HandleFunc("POST /api/vms/{id}/{action}", a.write(a.action))
 	mux.HandleFunc("DELETE /api/vms/{id}", a.write(a.remove))
-	mux.HandleFunc("GET /api/media", a.read(a.media))
-	mux.HandleFunc("GET /api/media/{id}", a.read(a.medium))
-	mux.HandleFunc("POST /api/media", a.write(a.addMedium))
-	mux.HandleFunc("PUT /api/media/{id}/upload", noDeadlines(a.write(a.upload)))
-	mux.HandleFunc("DELETE /api/media/{id}", a.write(a.deleteMedium))
+	for _, base := range []string{"/api/images", "/api/media"} { // media: the old name
+		mux.HandleFunc("GET "+base, a.read(a.media))
+		mux.HandleFunc("GET "+base+"/{id}", a.read(a.medium))
+		mux.HandleFunc("POST "+base, a.write(a.addMedium))
+		mux.HandleFunc("PATCH "+base+"/{id}", a.write(a.updateMedium))
+		mux.HandleFunc("PUT "+base+"/{id}/upload", noDeadlines(a.write(a.upload)))
+		mux.HandleFunc("DELETE "+base+"/{id}", a.write(a.deleteMedium))
+	}
 	mux.HandleFunc("GET /api/keys", a.read(a.keys))
 	mux.HandleFunc("POST /api/keys", a.write(a.addKey))
 	mux.HandleFunc("DELETE /api/keys/{id}", a.write(a.deleteKey))
+	mux.HandleFunc("GET /api/account", a.read(a.account))
+	mux.HandleFunc("PUT /api/account", a.write(a.setAccount))
+	mux.HandleFunc("GET /api/admin/vms", a.read(a.allMachines))
+	mux.HandleFunc("GET /api/admin/members", a.read(a.members))
+	mux.HandleFunc("PUT /api/admin/members/{owner}/quota", a.write(a.setQuota))
 	mux.HandleFunc("GET /api/vms/{id}/serial", a.consoleOf("console"))
 	mux.HandleFunc("GET /api/vms/{id}/vnc", a.consoleOf("vnc"))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusNotFound, detail("No such endpoint."))
 	})
+}
+
+func actor(s auth.Session) machines.Actor {
+	return machines.Actor{Owner: s.Owner, Username: s.Username, Admin: s.Admin}
 }
 
 type handler func(r *http.Request, s auth.Session) (status int, body any, err error)
@@ -126,16 +139,21 @@ func (a *API) write(h handler) http.HandlerFunc {
 }
 
 func (a *API) session(_ *http.Request, s auth.Session) (int, any, error) {
-	return http.StatusOK, map[string]any{"username": s.Username, "expires": s.Expires.UTC()}, nil
+	return http.StatusOK, map[string]any{"username": s.Username, "admin": s.Admin, "expires": s.Expires.UTC()}, nil
 }
 
-func (a *API) catalog(_ *http.Request, _ auth.Session) (int, any, error) {
-	c := a.machines.Catalog
-	images := make([]map[string]string, 0, len(c.Images))
-	for _, i := range c.Images {
-		images = append(images, map[string]string{"id": i.ID, "name": i.Name, "defaultUser": i.DefaultUser})
+func (a *API) catalog(r *http.Request, s auth.Session) (int, any, error) {
+	limits, err := a.machines.EffectiveLimits(r.Context(), actor(s))
+	if err != nil {
+		return 0, nil, err
 	}
-	return http.StatusOK, map[string]any{"images": images, "sizes": c.Sizes, "disk": c.Disk, "limits": c.Limits}, nil
+	c := a.machines.Catalog
+	return http.StatusOK, map[string]any{"sizes": c.Sizes, "disk": c.Disk, "limits": limits}, nil
+}
+
+func (a *API) nameAvailable(r *http.Request, _ auth.Session) (int, any, error) {
+	ok, reason, err := a.machines.NameAvailable(r.Context(), r.PathValue("name"))
+	return http.StatusOK, map[string]any{"available": ok, "reason": reason}, err
 }
 
 func (a *API) list(r *http.Request, s auth.Session) (int, any, error) {
@@ -147,7 +165,7 @@ func (a *API) list(r *http.Request, s auth.Session) (int, any, error) {
 }
 
 func (a *API) get(r *http.Request, s auth.Session) (int, any, error) {
-	m, err := a.machines.Get(r.Context(), s.Owner, r.PathValue("id"))
+	m, err := a.machines.Get(r.Context(), actor(s), r.PathValue("id"))
 	return http.StatusOK, m, err
 }
 
@@ -176,12 +194,9 @@ func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
 	}
 	c := a.machines.Catalog
 	b.Name = strings.TrimSpace(b.Name)
-	if n := utf8.RuneCountInString(b.Name); n < 1 || n > 63 || control.MatchString(b.Name) {
-		return 0, nil, bad("The name must be 1 to 63 characters.")
-	}
-	img, ok := c.Image(b.Image)
-	if !ok && b.Media == "" {
-		return 0, nil, bad("There is no image %q.", b.Image)
+	image := b.Image
+	if image == "" {
+		image = b.Media // the old field name
 	}
 	size, ok := c.Size(b.Size)
 	if !ok {
@@ -190,8 +205,8 @@ func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
 	if b.DiskGiB < c.Disk.MinGiB || b.DiskGiB > c.Disk.MaxGiB {
 		return 0, nil, bad("The disk must be %d to %d GiB.", c.Disk.MinGiB, c.Disk.MaxGiB)
 	}
-	// Optional: without one the default user has no password (SSH keys only); Create refuses that
-	// when the member has no keys either.
+	// Optional: without one the account has no password (SSH keys only); Create refuses that when
+	// the member has no keys either.
 	if n := utf8.RuneCountInString(b.Password); b.Password != "" && (n < 8 || n > 128 || control.MatchString(b.Password)) {
 		return 0, nil, bad("The password must be 8 to 128 characters, without control characters.")
 	}
@@ -205,24 +220,83 @@ func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
 			return 0, nil, err
 		}
 	}
-	if b.Media != "" {
-		img = config.Image{} // the medium decides
-	}
-	m, err := a.machines.Create(r.Context(), s.Owner, machines.Request{Name: b.Name, OwnerName: s.Username, Image: img, Size: size, DiskGiB: b.DiskGiB, PasswordHash: hash,
-		MediaID: b.Media, ProfileOverride: b.Profile})
+	m, err := a.machines.Create(r.Context(), actor(s), machines.Request{Name: b.Name, Size: size, DiskGiB: b.DiskGiB, PasswordHash: hash,
+		MediaID: image, ProfileOverride: b.Profile})
 	return http.StatusCreated, m, err
 }
 
 func (a *API) media(r *http.Request, s auth.Session) (int, any, error) {
-	list, err := a.machines.Media(r.Context(), s.Owner)
+	list, err := a.machines.Media(r.Context(), actor(s))
 	if err != nil {
 		return 0, nil, err
 	}
-	return http.StatusOK, map[string]any{"media": list}, nil
+	return http.StatusOK, map[string]any{"images": list, "media": list}, nil
+}
+
+func (a *API) updateMedium(r *http.Request, s auth.Session) (int, any, error) {
+	var b struct {
+		Name        *string        `json:"name"`
+		Public      *bool          `json:"public"`
+		CloudConfig map[string]any `json:"cloudConfig"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&b); err != nil {
+		return 0, nil, bad("The request isn't valid JSON for an image (cloudConfig must be an object).")
+	}
+	m, err := a.machines.UpdateMedium(r.Context(), actor(s), r.PathValue("id"), store.MediumUpdate{Name: b.Name, Public: b.Public, CloudConfig: b.CloudConfig})
+	return http.StatusOK, m, err
+}
+
+func (a *API) account(r *http.Request, s auth.Session) (int, any, error) {
+	acc, err := a.machines.GetAccount(r.Context(), actor(s))
+	return http.StatusOK, acc, err
+}
+
+func (a *API) setAccount(r *http.Request, s auth.Session) (int, any, error) {
+	var b struct {
+		UID *int `json:"uid"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&b); err != nil {
+		return 0, nil, bad("The request isn't valid JSON for your account.")
+	}
+	if err := a.machines.SetUID(r.Context(), actor(s), b.UID); err != nil {
+		return 0, nil, err
+	}
+	acc, err := a.machines.GetAccount(r.Context(), actor(s))
+	return http.StatusOK, acc, err
+}
+
+func (a *API) allMachines(r *http.Request, s auth.Session) (int, any, error) {
+	vms, err := a.machines.AllMachines(r.Context(), actor(s))
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusOK, map[string]any{"vms": vms}, nil
+}
+
+func (a *API) members(r *http.Request, s auth.Session) (int, any, error) {
+	list, err := a.machines.Members(r.Context(), actor(s))
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusOK, map[string]any{"members": list}, nil
+}
+
+func (a *API) setQuota(r *http.Request, s auth.Session) (int, any, error) {
+	var q store.Quota
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&q); err != nil {
+		return 0, nil, bad("The request isn't valid JSON for a quota.")
+	}
+	return http.StatusNoContent, nil, a.machines.SetQuota(r.Context(), actor(s), r.PathValue("owner"), q)
 }
 
 func (a *API) medium(r *http.Request, s auth.Session) (int, any, error) {
-	m, err := a.machines.GetMedium(r.Context(), s.Owner, r.PathValue("id"))
+	m, err := a.machines.GetMedium(r.Context(), actor(s), r.PathValue("id"))
 	return http.StatusOK, m, err
 }
 
@@ -246,9 +320,9 @@ func (a *API) addMedium(r *http.Request, s auth.Session) (int, any, error) {
 	var err error
 	switch b.Source {
 	case "upload":
-		m, err = a.machines.AddUpload(r.Context(), s.Owner, b.Name, b.SizeBytes, b.Header)
+		m, err = a.machines.AddUpload(r.Context(), actor(s), b.Name, b.SizeBytes, b.Header)
 	case "url":
-		m, err = a.machines.AddURL(r.Context(), s.Owner, b.Name, b.URL)
+		m, err = a.machines.AddURL(r.Context(), actor(s), b.Name, b.URL)
 	default:
 		return 0, nil, bad(`The source must be "upload" or "url".`)
 	}
@@ -260,11 +334,11 @@ func (a *API) upload(r *http.Request, s auth.Session) (int, any, error) {
 	if r.ContentLength <= 0 {
 		return 0, nil, bad("Send the file as the body, with its Content-Length.")
 	}
-	return http.StatusNoContent, nil, a.machines.Upload(r.Context(), s.Owner, r.PathValue("id"), r.Body, r.ContentLength)
+	return http.StatusNoContent, nil, a.machines.Upload(r.Context(), actor(s), r.PathValue("id"), r.Body, r.ContentLength)
 }
 
 func (a *API) deleteMedium(r *http.Request, s auth.Session) (int, any, error) {
-	return http.StatusNoContent, nil, a.machines.DeleteMedium(r.Context(), s.Owner, r.PathValue("id"))
+	return http.StatusNoContent, nil, a.machines.DeleteMedium(r.Context(), actor(s), r.PathValue("id"))
 }
 
 func (a *API) keys(r *http.Request, s auth.Session) (int, any, error) {
@@ -299,16 +373,16 @@ func (a *API) deleteKey(r *http.Request, s auth.Session) (int, any, error) {
 func (a *API) action(r *http.Request, s auth.Session) (int, any, error) {
 	switch act := r.PathValue("action"); act {
 	case "start", "stop", "restart":
-		return http.StatusNoContent, nil, a.machines.Action(r.Context(), s.Owner, r.PathValue("id"), act)
+		return http.StatusNoContent, nil, a.machines.Action(r.Context(), actor(s), r.PathValue("id"), act)
 	case "eject":
-		return http.StatusNoContent, nil, a.machines.Eject(r.Context(), s.Owner, r.PathValue("id"))
+		return http.StatusNoContent, nil, a.machines.Eject(r.Context(), actor(s), r.PathValue("id"))
 	default:
 		return 0, nil, &machines.Error{Status: http.StatusNotFound, Message: "No such action."}
 	}
 }
 
 func (a *API) remove(r *http.Request, s auth.Session) (int, any, error) {
-	return http.StatusNoContent, nil, a.machines.Delete(r.Context(), s.Owner, r.PathValue("id"))
+	return http.StatusNoContent, nil, a.machines.Delete(r.Context(), actor(s), r.PathValue("id"))
 }
 
 // events is the server-sent event stream of the member's machines: a snapshot, then changes as the
@@ -333,7 +407,11 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 
 	// Subscribe before taking the snapshot, so nothing between the two is missed (a change seen in
 	// both is sent twice, which the client treats as the same update).
-	ch, unsubscribe := a.machines.Subscribe(s.Owner)
+	viewer := s.Owner
+	if s.Admin {
+		viewer = machines.Everyone // admins hear of every machine and image; the snapshot stays their own
+	}
+	ch, unsubscribe := a.machines.Subscribe(viewer)
 	defer unsubscribe()
 	vms, err := a.machines.List(ctx, s.Owner)
 	if err != nil {
@@ -383,7 +461,7 @@ func (a *API) consoleOf(kind string) http.HandlerFunc {
 			return
 		}
 		id := r.PathValue("id")
-		running, err := a.machines.Running(r.Context(), s.Owner, id)
+		running, err := a.machines.Running(r.Context(), actor(s), id)
 		if err != nil {
 			a.fail(w, err)
 			return

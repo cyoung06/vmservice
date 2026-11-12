@@ -11,7 +11,7 @@ import { useSidebar } from "./sidebar-provider";
 import { UserMenu } from "./user-menu";
 
 export const Sidebar = () => {
-  const { configuration } = useSession();
+  const { configuration, user } = useSession();
   const { machines } = useMachines();
   const { mobileOpen, setMobileOpen } = useSidebar();
 
@@ -53,13 +53,24 @@ export const Sidebar = () => {
             <SidebarLink href="/new" icon={<Icon name="plus" size={15} />}>
               New machine
             </SidebarLink>
-            <SidebarLink href="/media" icon={<Icon name="hard-drive" size={15} />}>
-              Media
+            <SidebarLink href="/images" icon={<Icon name="hard-drive" size={15} />}>
+              Images
             </SidebarLink>
-            <SidebarLink href="/keys" icon={<Icon name="key" size={15} />}>
-              SSH keys
+            <SidebarLink href="/keys" icon={<Icon name="user" size={15} />}>
+              Account
             </SidebarLink>
           </div>
+          {user.admin ? (
+            <div className="mt-4 flex flex-col gap-px">
+              <div className="px-2 pb-1 text-2xs font-medium uppercase tracking-wide text-foreground-quaternary">Admin</div>
+              <SidebarLink href="/admin/machines" icon={<Icon name="layers" size={15} />}>
+                All machines
+              </SidebarLink>
+              <SidebarLink href="/admin/members" icon={<Icon name="users" size={15} />}>
+                Members
+              </SidebarLink>
+            </div>
+          ) : null}
         </nav>
 
         <div className="flex h-12 items-center gap-1 border-t border-border px-2 md:h-11">

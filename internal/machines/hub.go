@@ -14,8 +14,12 @@ type Event struct {
 type change struct {
 	owner  string
 	id     string
-	medium bool // a medium, not a machine
+	medium bool // an image, not a machine
+	public bool // an image everyone sees (or saw): every member's stream hears of it
 }
+
+// Everyone is the subscriber "owner" of admins' streams: they hear of every change.
+const Everyone = "*"
 
 type subscriber struct {
 	owner string
@@ -29,14 +33,14 @@ type hub struct {
 	unsub  chan *subscriber
 	pub    chan change
 	done   <-chan struct{}
-	render func(change) Event
+	render func(c change, viewer string) Event
 }
 
 // A stream that falls this far behind is closed; its client reconnects and gets a new snapshot.
 const subscriberBuffer = 64
 
 // newHub runs the hub until ctx ends. render builds the event for a change from current state.
-func newHub(ctx context.Context, render func(change) Event) *hub {
+func newHub(ctx context.Context, render func(change, string) Event) *hub {
 	h := &hub{sub: make(chan *subscriber), unsub: make(chan *subscriber), pub: make(chan change, 256), done: ctx.Done(), render: render}
 	go h.run(ctx)
 	return h
@@ -62,17 +66,12 @@ func (h *hub) run(ctx context.Context) {
 		case s := <-h.unsub:
 			drop(s)
 		case c := <-h.pub:
-			var e *Event
 			for s := range subs {
-				if s.owner != c.owner {
+				if s.owner != c.owner && s.owner != Everyone && !c.public {
 					continue
 				}
-				if e == nil {
-					rendered := h.render(c)
-					e = &rendered
-				}
 				select {
-				case s.ch <- *e:
+				case s.ch <- h.render(c, s.owner): // per viewer: what they may see, and "mine"
 				default:
 					drop(s)
 				}

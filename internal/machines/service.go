@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -53,6 +54,16 @@ func (e *Error) HTTPStatus() int { return e.Status }
 func refuse(status int, format string, args ...any) *Error {
 	return &Error{status, fmt.Sprintf(format, args...)}
 }
+
+// Actor is who's asking: a member, possibly an admin (who may act on every member's machines and
+// images, and has no limits).
+type Actor struct {
+	Owner    string
+	Username string
+	Admin    bool
+}
+
+func (a Actor) may(owner string) bool { return a.Admin || a.Owner == owner }
 
 // ErrNotFound is a machine that doesn't exist or isn't the caller's: the two look the same.
 var ErrNotFound = refuse(http.StatusNotFound, "No such machine.")
@@ -213,23 +224,25 @@ func (s *Service) jobChanged(o any) {
 	}
 }
 
-// render is the event for a change, from the store and the cache as they are now: the machine, or
-// "deleted" when its row is gone or isn't this owner's.
-func (s *Service) render(c change) Event {
+// render is the event for a change as viewer (an owner, or Everyone for admins) may see it, from the
+// store and the cache as they are now: the machine or image, or "deleted" when it's gone or not
+// theirs to see.
+func (s *Service) render(c change, viewer string) Event {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	a := Actor{Owner: viewer, Admin: viewer == Everyone}
 	if c.medium {
 		row, err := s.store.Medium(ctx, c.id)
-		if err != nil || row.Owner != c.owner {
-			return Event{Kind: "medium-deleted", Data: map[string]string{"id": c.id}}
+		if err != nil || !visible(row, a) {
+			return Event{Kind: "image-deleted", Data: map[string]string{"id": c.id}}
 		}
-		return Event{Kind: "medium", Data: s.toMedium(ctx, row, time.Now())}
+		return Event{Kind: "image", Data: s.toMedium(ctx, row, a, time.Now())}
 	}
 	row, err := s.store.Machine(ctx, c.id)
-	if err != nil || row.Owner != c.owner {
+	if err != nil || !a.may(row.Owner) {
 		return Event{Kind: "deleted", Data: map[string]string{"id": c.id}}
 	}
-	return Event{Kind: "vm", Data: toMachine(row, s.vm(ctx, c.id), s.disk(ctx, c.id), s.Catalog, time.Now())}
+	return Event{Kind: "vm", Data: toMachine(row, s.vm(ctx, c.id), s.disk(ctx, c.id), time.Now())}
 }
 
 // Subscribe returns the owner's machine events until cancel is called or the stream falls behind
@@ -242,24 +255,41 @@ func (s *Service) Subscribe(owner string) (<-chan Event, func()) {
 func (s *Service) List(ctx context.Context, owner string) ([]Machine, error) {
 	rows, err := s.store.Machines(ctx, owner)
 	if err != nil {
-		return nil, err
+		return nil, s.storeError("reading your machines", err)
 	}
+	return s.machinesOf(ctx, rows), nil
+}
+
+// AllMachines is every member's machines (admins).
+func (s *Service) AllMachines(ctx context.Context, a Actor) ([]Machine, error) {
+	if !a.Admin {
+		return nil, refuse(http.StatusForbidden, "Only admins can see every machine.")
+	}
+	rows, err := s.store.AllMachines(ctx)
+	if err != nil {
+		return nil, s.storeError("reading the machines", err)
+	}
+	return s.machinesOf(ctx, rows), nil
+}
+
+func (s *Service) machinesOf(ctx context.Context, rows []store.Machine) []Machine {
 	now := time.Now()
 	out := make([]Machine, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, toMachine(row, s.vm(ctx, row.ID), s.disk(ctx, row.ID), s.Catalog, now))
+		out = append(out, toMachine(row, s.vm(ctx, row.ID), s.disk(ctx, row.ID), now))
 	}
-	return out, nil
+	return out
 }
 
-// get is the owner's machine id: its row and, if it exists, its VM. Every request naming a machine
-// goes through here first; an id the service couldn't have made is refused before it goes anywhere.
-func (s *Service) get(ctx context.Context, owner, id string) (store.Machine, *kubevirtv1.VirtualMachine, error) {
+// get is a machine the actor may act on: its row and, if it exists, its VM. Every request naming a
+// machine goes through here first; an id the service couldn't have made is refused before it goes
+// anywhere, and someone else's machine looks like no machine (except to admins).
+func (s *Service) get(ctx context.Context, a Actor, id string) (store.Machine, *kubevirtv1.VirtualMachine, error) {
 	if !idFormat.MatchString(id) {
 		return store.Machine{}, nil, ErrNotFound
 	}
 	row, err := s.store.Machine(ctx, id)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && row.Owner != owner) {
+	if errors.Is(err, store.ErrNotFound) || (err == nil && !a.may(row.Owner)) {
 		return store.Machine{}, nil, ErrNotFound
 	}
 	if err != nil {
@@ -268,13 +298,13 @@ func (s *Service) get(ctx context.Context, owner, id string) (store.Machine, *ku
 	return row, s.vm(ctx, id), nil
 }
 
-// Get is one of the owner's machines.
-func (s *Service) Get(ctx context.Context, owner, id string) (Machine, error) {
-	row, vm, err := s.get(ctx, owner, id)
+// Get is a machine the actor may see.
+func (s *Service) Get(ctx context.Context, a Actor, id string) (Machine, error) {
+	row, vm, err := s.get(ctx, a, id)
 	if err != nil {
 		return Machine{}, err
 	}
-	return toMachine(row, vm, s.disk(ctx, id), s.Catalog, time.Now()), nil
+	return toMachine(row, vm, s.disk(ctx, id), time.Now()), nil
 }
 
 // EnsureMember adds the member if a session from before they had a row is in use.
@@ -290,78 +320,139 @@ func (s *Service) Usage(ctx context.Context, owner string) (store.Usage, error) 
 	return s.store.Usage(ctx, owner)
 }
 
+// hostname is a machine's name: a DNS label, and not shaped like a machine id.
+var hostname = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// unixName is a username that can be an account on a machine.
+var unixName = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// NameAvailable says whether name can be a new machine's name, and why not.
+func (s *Service) NameAvailable(ctx context.Context, name string) (bool, string, error) {
+	if !hostname.MatchString(name) || idFormat.MatchString(name) {
+		return false, "Use lowercase letters, digits and dashes (1 to 63, not starting or ending with a dash).", nil
+	}
+	if _, err := s.store.MachineByName(ctx, name); err == nil {
+		return false, "Another machine already has this name.", nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return false, "", s.storeError("checking the name", err)
+	}
+	return true, "", nil
+}
+
+// limits is a member's effective quota: theirs where set, else the catalog's.
+func (s *Service) limits(q store.Quota) store.Quota {
+	l := s.Catalog.Limits
+	pick := func(v *int, d int) *int {
+		if v != nil {
+			return v
+		}
+		return &d
+	}
+	return store.Quota{VMs: pick(q.VMs, l.VMs), CPU: pick(q.CPU, l.CPU), MemoryMiB: pick(q.MemoryMiB, l.MemoryMiB), DiskGiB: pick(q.DiskGiB, l.DiskGiB)}
+}
+
+// EffectiveLimits is the actor's quota (nil fields: no limit, for admins).
+func (s *Service) EffectiveLimits(ctx context.Context, a Actor) (store.Quota, error) {
+	if a.Admin {
+		return store.Quota{}, nil
+	}
+	m, err := s.store.Member(ctx, a.Owner)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return store.Quota{}, s.storeError("reading your quota", err)
+	}
+	return s.limits(m.Quota), nil
+}
+
 // createTimeout bounds the steps after the row: the VM, its Secret and the start.
 const createTimeout = time.Minute
 
-// Create makes a machine for owner and starts it.
-func (s *Service) Create(ctx context.Context, owner string, r Request) (Machine, error) {
-	l := s.Catalog.Limits
-	check := func(u store.Usage) error {
-		switch {
-		case u.VMs+1 > l.VMs:
-			return &store.LimitError{Message: fmt.Sprintf("You already have %d of %d machines.", u.VMs, l.VMs)}
-		case u.CPU+r.Size.CPU > l.CPU:
-			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d vCPUs.", u.CPU+r.Size.CPU, l.CPU)}
-		case u.MemoryMiB+r.Size.MemoryMiB > l.MemoryMiB:
-			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d MiB of memory.", u.MemoryMiB+r.Size.MemoryMiB, l.MemoryMiB)}
-		case u.DiskGiB+r.DiskGiB > l.DiskGiB:
-			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d GiB of disk.", u.DiskGiB+r.DiskGiB, l.DiskGiB)}
+// Create makes a machine for the actor from an image and starts it.
+func (s *Service) Create(ctx context.Context, a Actor, r Request) (Machine, error) {
+	if ok, why, err := s.NameAvailable(ctx, r.Name); err != nil {
+		return Machine{}, err
+	} else if !ok {
+		status := http.StatusBadRequest
+		if hostname.MatchString(r.Name) && !idFormat.MatchString(r.Name) {
+			status = http.StatusConflict // valid, but taken
 		}
-		return nil
+		return Machine{}, refuse(status, "%s", why)
 	}
-	// The member's SSH keys as they are now (later ones are managed inside the machine). Without
-	// keys or a password nothing could sign in to the machine.
-	keys, err := s.store.Keys(ctx, owner)
+	ref, err := s.resolveMedium(ctx, a, r.MediaID)
+	if err != nil {
+		return Machine{}, err
+	}
+	r.media, r.profile, r.driversImage, r.cloudExtras = &ref, ref.Profile, s.MediaConfig.DriversImage, ref.CloudConfig
+	if p := r.ProfileOverride; p != "" {
+		if p != "windows" && p != "linux" && p != "uefi" && p != "bios" {
+			return Machine{}, refuse(http.StatusBadRequest, "There is no profile %q.", p)
+		}
+		r.profile = p
+	}
+	if need := (ref.PVCBytes + (1<<30 - 1)) >> 30; int64(r.DiskGiB) < need {
+		return Machine{}, refuse(http.StatusBadRequest, "The disk must be at least %d GiB for this image.", need)
+	}
+	keys, err := s.store.Keys(ctx, a.Owner)
 	if err != nil {
 		return Machine{}, s.storeError("reading your SSH keys", err)
-	}
-	if r.MediaID != "" {
-		ref, err := s.resolveMedium(ctx, owner, r.MediaID)
-		if err != nil {
-			return Machine{}, err
-		}
-		r.media, r.profile, r.driversImage = &ref, ref.Profile, s.MediaConfig.DriversImage
-		if p := r.ProfileOverride; p != "" {
-			if p != "windows" && p != "linux" && p != "uefi" && p != "bios" {
-				return Machine{}, refuse(http.StatusBadRequest, "There is no profile %q.", p)
-			}
-			r.profile = p
-		}
-		if need := (ref.PVCBytes + (1<<30 - 1)) >> 30; int64(r.DiskGiB) < need {
-			return Machine{}, refuse(http.StatusBadRequest, "The disk must be at least %d GiB for this medium.", need)
-		}
-		// No password from here: an installer sets one (ISO); a disk image's default user is the
-		// image's own, reached with the member's SSH keys.
-		r.PasswordHash = ""
-		if ref.Kind == "disk" && len(keys) == 0 {
-			return Machine{}, refuse(http.StatusBadRequest, "Add an SSH key first: it's how you sign in to a machine made from a disk image.")
-		}
-	} else if len(keys) == 0 && r.PasswordHash == "" {
-		return Machine{}, refuse(http.StatusBadRequest, "Set a password or add an SSH key first: otherwise nothing can sign in to the machine.")
 	}
 	for _, k := range keys {
 		r.AuthorizedKeys = append(r.AuthorizedKeys, k.Line)
 	}
+	if r.profile == "windows" {
+		r.PasswordHash = "" // Setup makes the account
+	} else {
+		if !unixName.MatchString(a.Username) {
+			return Machine{}, refuse(http.StatusBadRequest, "Your username %q can't be an account name on a machine.", a.Username)
+		}
+		if len(keys) == 0 && r.PasswordHash == "" {
+			return Machine{}, refuse(http.StatusBadRequest, "Set a password or add an SSH key first: otherwise nothing can sign in to the machine.")
+		}
+		member, err := s.store.Member(ctx, a.Owner)
+		if err != nil {
+			return Machine{}, s.storeError("reading your account", err)
+		}
+		r.OwnerName, r.UID = a.Username, member.UID
+	}
+	check := func(u store.Usage, q store.Quota) error {
+		if a.Admin {
+			return nil
+		}
+		l := s.limits(q)
+		switch {
+		case u.VMs+1 > *l.VMs:
+			return &store.LimitError{Message: fmt.Sprintf("You already have %d of %d machines.", u.VMs, *l.VMs)}
+		case u.CPU+r.Size.CPU > *l.CPU:
+			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d vCPUs.", u.CPU+r.Size.CPU, *l.CPU)}
+		case u.MemoryMiB+r.Size.MemoryMiB > *l.MemoryMiB:
+			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d MiB of memory.", u.MemoryMiB+r.Size.MemoryMiB, *l.MemoryMiB)}
+		case u.DiskGiB+r.DiskGiB > *l.DiskGiB:
+			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d GiB of disk.", u.DiskGiB+r.DiskGiB, *l.DiskGiB)}
+		}
+		return nil
+	}
 	var row store.Machine
 	for attempt := 0; ; attempt++ {
-		row = store.Machine{ID: newID(), Owner: owner, Name: r.Name, Image: r.Image.ID, Size: r.Size.ID, CPU: r.Size.CPU, MemoryMiB: r.Size.MemoryMiB, DiskGiB: r.DiskGiB, Profile: r.profile}
-		if r.media != nil {
-			row.Media = r.media.ID
-		}
+		row = store.Machine{ID: newID(), Owner: a.Owner, Name: r.Name, Image: ref.Name, Size: r.Size.ID, CPU: r.Size.CPU, MemoryMiB: r.Size.MemoryMiB, DiskGiB: r.DiskGiB, Media: ref.ID, Profile: r.profile}
 		err := s.store.CreateMachine(ctx, row, check)
 		var le *store.LimitError
 		switch {
 		case err == nil:
 		case errors.As(err, &le):
 			return Machine{}, refuse(http.StatusForbidden, "%s", le.Message)
-		case errors.Is(err, store.ErrExists) && attempt < 3:
-			continue
+		case errors.Is(err, store.ErrExists):
+			if _, nerr := s.store.MachineByName(ctx, r.Name); nerr == nil {
+				return Machine{}, refuse(http.StatusConflict, "Another machine already has this name.")
+			}
+			if attempt < 3 {
+				continue // the id was taken
+			}
+			return Machine{}, s.storeError("saving the machine", err)
 		default:
 			return Machine{}, s.storeError("saving the machine", err)
 		}
 		break
 	}
-	row.CreatedAt = time.Now()
+	row.CreatedAt, row.OwnerName = time.Now(), a.Username
 
 	// From here the machine is the member's; the rest finishes even if they go away (one deadline
 	// covers it). The VM is created with run strategy Manual (not running), then its cloud-init
@@ -377,29 +468,40 @@ func (s *Service) Create(ctx context.Context, owner string, r Request) (Machine,
 		}
 		return Machine{}, s.kubeError(what, err)
 	}
-	vm := buildVM(s.Namespace, row.ID, owner, s.Catalog.StorageClass, r)
+	vm := buildVM(s.Namespace, row.ID, a.Owner, s.Catalog.StorageClass, r)
 	if err := s.write.Create(ctx, vm); err != nil {
 		return abandon("creating the machine", err)
 	}
-	userData, err := cloudConfig(vm.Name, r)
-	if err == nil {
-		err = s.write.Create(ctx, buildSecret(vm, userData))
-	}
-	if err != nil {
-		s.write.Delete(ctx, vm) // the watch then removes the row
-		return Machine{}, s.kubeError("creating the machine's cloud-init", err)
+	if hasVolume(vm, "cloudinit") {
+		userData, err := cloudConfig(r.Name, r)
+		if err == nil {
+			err = s.write.Create(ctx, buildSecret(vm, userData))
+		}
+		if err != nil {
+			s.write.Delete(ctx, vm) // the watch then removes the row
+			return Machine{}, s.kubeError("creating the machine's cloud-init", err)
+		}
 	}
 	if err := s.subresource(ctx, vm.Name, "start"); err != nil {
 		return Machine{}, err
 	}
-	s.log.Info("machine created", "owner", owner, "id", vm.Name, "image", r.Image.ID, "size", r.Size.ID, "diskGiB", r.DiskGiB)
-	return toMachine(row, vm, nil, s.Catalog, time.Now()), nil
+	s.log.Info("machine created", "owner", a.Owner, "id", vm.Name, "name", r.Name, "image", ref.ID, "profile", r.profile, "size", r.Size.ID, "diskGiB", r.DiskGiB)
+	return toMachine(row, vm, nil, time.Now()), nil
+}
+
+func hasVolume(vm *kubevirtv1.VirtualMachine, name string) bool {
+	for _, v := range vm.Spec.Template.Spec.Volumes {
+		if v.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Eject removes a machine's install CD-ROMs (the ISO and the driver CD) so it boots from its disk,
 // and restarts it if it's running. The ISO's per-machine copy is deleted with them.
-func (s *Service) Eject(ctx context.Context, owner, id string) error {
-	if _, _, err := s.get(ctx, owner, id); err != nil {
+func (s *Service) Eject(ctx context.Context, a Actor, id string) error {
+	if _, _, err := s.get(ctx, a, id); err != nil {
 		return err
 	}
 	running := false
@@ -432,7 +534,7 @@ func (s *Service) Eject(ctx context.Context, owner, id string) error {
 	if err := s.write.Delete(ctx, install, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 		s.log.Warn("deleting an ejected ISO copy", "id", id, "err", err)
 	}
-	s.log.Info("install media ejected", "owner", owner, "id", id)
+	s.log.Info("install media ejected", "by", a.Username, "id", id)
 	if running {
 		return s.subresource(ctx, id, "restart")
 	}
@@ -440,8 +542,8 @@ func (s *Service) Eject(ctx context.Context, owner, id string) error {
 }
 
 // Action is start, stop or restart.
-func (s *Service) Action(ctx context.Context, owner, id, action string) error {
-	_, vm, err := s.get(ctx, owner, id)
+func (s *Service) Action(ctx context.Context, a Actor, id, action string) error {
+	_, vm, err := s.get(ctx, a, id)
 	if err != nil {
 		return err
 	}
@@ -453,8 +555,8 @@ func (s *Service) Action(ctx context.Context, owner, id, action string) error {
 
 // Delete deletes the machine's VM (its disk and cloud-init Secret go with it); the watch removes the
 // row once the VM is gone. A machine whose VM is already missing loses its row here.
-func (s *Service) Delete(ctx context.Context, owner, id string) error {
-	row, vm, err := s.get(ctx, owner, id)
+func (s *Service) Delete(ctx context.Context, a Actor, id string) error {
+	row, vm, err := s.get(ctx, a, id)
 	if err != nil {
 		return err
 	}
@@ -475,7 +577,7 @@ func (s *Service) Delete(ctx context.Context, owner, id string) error {
 			if err := s.store.DeleteMachine(ctx, id); err != nil {
 				return s.storeError("deleting the machine", err)
 			}
-			s.hub.publish(change{owner: owner, id: id})
+			s.hub.publish(change{owner: row.Owner, id: id})
 		}
 	}
 	if vm != nil {
@@ -483,13 +585,13 @@ func (s *Service) Delete(ctx context.Context, owner, id string) error {
 			return s.kubeError("deleting the machine", err)
 		}
 	}
-	s.log.Info("machine deleted", "owner", owner, "id", id)
+	s.log.Info("machine deleted", "by", a.Username, "owner", row.Owner, "id", id)
 	return nil
 }
 
 // Running says whether the machine has a running instance (its consoles exist).
-func (s *Service) Running(ctx context.Context, owner, id string) (bool, error) {
-	_, vm, err := s.get(ctx, owner, id)
+func (s *Service) Running(ctx context.Context, a Actor, id string) (bool, error) {
+	_, vm, err := s.get(ctx, a, id)
 	if err != nil || vm == nil {
 		return false, err
 	}
@@ -542,4 +644,83 @@ func APIServer(cfg *rest.Config) string {
 		host = "https://" + host
 	}
 	return host
+}
+
+// Account is the actor's account settings for new machines.
+type Account struct {
+	Username string `json:"username"`
+	UID      *int   `json:"uid"`
+}
+
+// GetAccount is the actor's account.
+func (s *Service) GetAccount(ctx context.Context, a Actor) (Account, error) {
+	m, err := s.store.Member(ctx, a.Owner)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return Account{}, s.storeError("reading your account", err)
+	}
+	return Account{Username: a.Username, UID: m.UID}, nil
+}
+
+// SetUID sets the uid of the actor's account on machines made from now on (nil: the distro picks).
+func (s *Service) SetUID(ctx context.Context, a Actor, uid *int) error {
+	if uid != nil && (*uid < 1000 || *uid > 60000) {
+		return refuse(http.StatusBadRequest, "The UID must be 1000 to 60000.")
+	}
+	if err := s.store.EnsureMember(ctx, a.Owner, a.Username); err != nil {
+		return s.storeError("recording you", err)
+	}
+	if err := s.store.SetUID(ctx, a.Owner, uid); err != nil {
+		return s.storeError("saving your UID", err)
+	}
+	return nil
+}
+
+// MemberInfo is a member as admins see them.
+type MemberInfo struct {
+	Owner      string      `json:"owner"`
+	Username   string      `json:"username"`
+	Usage      store.Usage `json:"usage"`
+	Quota      store.Quota `json:"quota"`
+	SignedInAt time.Time   `json:"signedInAt"`
+}
+
+// Members is every member with usage and quota (admins).
+func (s *Service) Members(ctx context.Context, a Actor) ([]MemberInfo, error) {
+	if !a.Admin {
+		return nil, refuse(http.StatusForbidden, "Only admins can see the members.")
+	}
+	members, err := s.store.Members(ctx)
+	if err != nil {
+		return nil, s.storeError("reading the members", err)
+	}
+	out := make([]MemberInfo, 0, len(members))
+	for _, m := range members {
+		u, err := s.store.Usage(ctx, m.Owner)
+		if err != nil {
+			return nil, s.storeError("reading usage", err)
+		}
+		out = append(out, MemberInfo{Owner: m.Owner, Username: m.Username, Usage: u, Quota: m.Quota, SignedInAt: m.SignedInAt.UTC()})
+	}
+	return out, nil
+}
+
+// SetQuota sets a member's quota (nil fields: the default; admins).
+func (s *Service) SetQuota(ctx context.Context, a Actor, owner string, q store.Quota) error {
+	if !a.Admin {
+		return refuse(http.StatusForbidden, "Only admins can change quotas.")
+	}
+	for _, v := range []*int{q.VMs, q.CPU, q.MemoryMiB, q.DiskGiB} {
+		if v != nil && *v < 0 {
+			return refuse(http.StatusBadRequest, "Quotas can't be negative.")
+		}
+	}
+	err := s.store.SetQuota(ctx, owner, q)
+	if errors.Is(err, store.ErrNotFound) {
+		return refuse(http.StatusNotFound, "No such member.")
+	}
+	if err != nil {
+		return s.storeError("saving the quota", err)
+	}
+	s.log.Info("quota set", "by", a.Username, "owner", owner)
+	return nil
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -54,29 +55,34 @@ const (
 
 var mediumID = regexp.MustCompile(`^md-[a-km-np-z2-9]{6}$`)
 
-// Medium is a medium as the API shows it.
+// Medium is an image as the API shows it.
 type Medium struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	Shared       bool      `json:"shared"`
-	Source       string    `json:"source"`
-	Kind         string    `json:"kind"`
-	Profile      string    `json:"profile"`
-	SizeBytes    int64     `json:"sizeBytes"`
-	VirtualBytes int64     `json:"virtualBytes"`
-	State        string    `json:"state"`
-	Progress     string    `json:"progress"`
-	Detail       string    `json:"detail"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID           string         `json:"id"`
+	Name         string         `json:"name"`
+	Owner        string         `json:"owner"` // the owner's username
+	Mine         bool           `json:"mine"`
+	Public       bool           `json:"public"`
+	CloudConfig  map[string]any `json:"cloudConfig"`
+	Source       string         `json:"source"`
+	Kind         string         `json:"kind"`
+	Profile      string         `json:"profile"`
+	SizeBytes    int64          `json:"sizeBytes"`
+	VirtualBytes int64          `json:"virtualBytes"`
+	State        string         `json:"state"`
+	Progress     string         `json:"progress"`
+	Detail       string         `json:"detail"`
+	CreatedAt    time.Time      `json:"createdAt"`
 }
 
 // mediaRef is a medium resolved for making a machine from it.
 type mediaRef struct {
-	ID       string
-	PVC      string
-	Kind     string
-	Profile  string
-	PVCBytes int64 // the DataVolume's storage request: a machine's disk must be at least this
+	ID          string
+	Name        string
+	CloudConfig map[string]any
+	PVC         string
+	Kind        string
+	Profile     string
+	PVCBytes    int64 // the DataVolume's storage request: a machine's disk must be at least this
 }
 
 func newMediumID() string { return mediaPrefix + newID()[3:] }
@@ -121,11 +127,11 @@ func mediumState(dv *cdiv1.DataVolume, upload, inspected bool, created, now time
 			}
 		}
 		return "Failed", "", detail
-	case cdiv1.UploadReady, cdiv1.UploadScheduled:
-		return "Uploading", progress, ""
+	case cdiv1.UploadReady:
+		return "Uploading", progress, "" // CDI's upload server is waiting for the file
 	}
 	if upload && dv.Status.Phase != cdiv1.ImportInProgress {
-		return "Uploading", progress, ""
+		return "Preparing", "", "" // the upload server is starting: the browser waits before sending
 	}
 	return "Importing", progress, ""
 }
@@ -138,90 +144,122 @@ func (s *Service) dataVolume(ctx context.Context, name string) *cdiv1.DataVolume
 	return &dv
 }
 
-func (s *Service) toMedium(ctx context.Context, row store.Medium, now time.Time) Medium {
-	m := Medium{ID: row.ID, Name: row.Name, Source: row.Source, Kind: row.Kind, Profile: row.Profile,
+func (s *Service) toMedium(ctx context.Context, row store.Medium, a Actor, now time.Time) Medium {
+	m := Medium{ID: row.ID, Name: row.Name, Owner: row.OwnerName, Mine: row.Owner == a.Owner, Public: row.Public,
+		CloudConfig: row.CloudConfig, Source: row.Source, Kind: row.Kind, Profile: row.Profile,
 		SizeBytes: row.SizeBytes, VirtualBytes: row.VirtualBytes, CreatedAt: row.CreatedAt.UTC()}
+	if m.CloudConfig == nil {
+		m.CloudConfig = map[string]any{}
+	}
 	m.State, m.Progress, m.Detail = mediumState(s.dataVolume(ctx, row.ID), row.Source == "upload", row.Profile != "", row.CreatedAt, now)
 	return m
 }
 
-func (s *Service) sharedMedia(ctx context.Context) []Medium {
-	out := make([]Medium, 0, len(s.Catalog.Media))
-	for _, c := range s.Catalog.Media {
-		dv := s.dataVolume(ctx, c.Source)
-		m := Medium{ID: c.ID, Name: c.Name, Shared: true, Source: "shared", Kind: c.Kind, Profile: c.Profile, VirtualBytes: dvRequest(dv), SizeBytes: dvRequest(dv)}
-		if dv != nil {
-			m.CreatedAt = dv.CreationTimestamp.UTC()
-		}
-		m.State, m.Progress, m.Detail = mediumState(dv, false, true, time.Time{}, time.Now())
-		out = append(out, m)
-	}
-	return out
-}
+// visible says whether the actor may see (and make machines from) an image.
+func visible(row store.Medium, a Actor) bool { return row.Public || a.may(row.Owner) }
 
-// Media is the owner's media, then the shared ones.
-func (s *Service) Media(ctx context.Context, owner string) ([]Medium, error) {
-	rows, err := s.store.Media(ctx, owner)
+// Media is the actor's images, then the public ones (admins: everyone's).
+func (s *Service) Media(ctx context.Context, a Actor) ([]Medium, error) {
+	var rows []store.Medium
+	var err error
+	if a.Admin {
+		rows, err = s.store.AllMedia(ctx)
+	} else {
+		var mine, public []store.Medium
+		if mine, err = s.store.Media(ctx, a.Owner); err == nil {
+			public, err = s.store.PublicMedia(ctx)
+		}
+		rows = mine
+		for _, p := range public {
+			if p.Owner != a.Owner {
+				rows = append(rows, p)
+			}
+		}
+	}
 	if err != nil {
-		return nil, s.storeError("reading your media", err)
+		return nil, s.storeError("reading the images", err)
 	}
 	now := time.Now()
-	out := make([]Medium, 0, len(rows)+len(s.Catalog.Media))
+	out := make([]Medium, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, s.toMedium(ctx, r, now))
+		out = append(out, s.toMedium(ctx, r, a, now))
 	}
-	return append(out, s.sharedMedia(ctx)...), nil
+	return out, nil
 }
 
 var errNoMedium = refuse(http.StatusNotFound, "No such medium.")
 
-// ownMedium is one of the owner's media rows.
-func (s *Service) ownMedium(ctx context.Context, owner, id string) (store.Medium, error) {
+// mediumRow is an image the actor may see; edit says it must also be theirs to change (owner or
+// admin). Anything else looks like no image.
+func (s *Service) mediumRow(ctx context.Context, a Actor, id string, edit bool) (store.Medium, error) {
 	if !mediumID.MatchString(id) {
 		return store.Medium{}, errNoMedium
 	}
 	row, err := s.store.Medium(ctx, id)
-	if errors.Is(err, store.ErrNotFound) || (err == nil && row.Owner != owner) {
+	if errors.Is(err, store.ErrNotFound) || (err == nil && (!visible(row, a) || edit && !a.may(row.Owner))) {
 		return store.Medium{}, errNoMedium
 	}
 	if err != nil {
-		return store.Medium{}, s.storeError("reading the medium", err)
+		return store.Medium{}, s.storeError("reading the image", err)
 	}
 	return row, nil
 }
 
-// GetMedium is one of the owner's media or a shared one.
-func (s *Service) GetMedium(ctx context.Context, owner, id string) (Medium, error) {
-	for _, m := range s.sharedMedia(ctx) {
-		if m.ID == id {
-			return m, nil
-		}
-	}
-	row, err := s.ownMedium(ctx, owner, id)
+// GetMedium is an image the actor may see.
+func (s *Service) GetMedium(ctx context.Context, a Actor, id string) (Medium, error) {
+	row, err := s.mediumRow(ctx, a, id, false)
 	if err != nil {
 		return Medium{}, err
 	}
-	return s.toMedium(ctx, row, time.Now()), nil
+	return s.toMedium(ctx, row, a, time.Now()), nil
 }
 
-// resolveMedium is a Ready medium the owner may make a machine from.
-func (s *Service) resolveMedium(ctx context.Context, owner, id string) (mediaRef, error) {
-	if c, ok := s.Catalog.SharedMedium(id); ok {
-		dv := s.dataVolume(ctx, c.Source)
-		if state, _, _ := mediumState(dv, false, true, time.Time{}, time.Now()); state != "Ready" {
-			return mediaRef{}, refuse(http.StatusConflict, "That medium isn't ready.")
-		}
-		return mediaRef{ID: c.ID, PVC: c.Source, Kind: c.Kind, Profile: c.Profile, PVCBytes: dvRequest(dv)}, nil
+// UpdateMedium changes an image's name, public flag or cloud-config extras (owner or admin).
+func (s *Service) UpdateMedium(ctx context.Context, a Actor, id string, u store.MediumUpdate) (Medium, error) {
+	if _, err := s.mediumRow(ctx, a, id, true); err != nil {
+		return Medium{}, err
 	}
-	row, err := s.ownMedium(ctx, owner, id)
+	if u.Name != nil {
+		name, err := checkMediumName(*u.Name)
+		if err != nil {
+			return Medium{}, err
+		}
+		u.Name = &name
+	}
+	for k := range u.CloudConfig {
+		if slices.Contains(reservedCloudKeys, k) {
+			return Medium{}, refuse(http.StatusBadRequest, "The cloud-config extras can't set %q: VMService sets it.", k)
+		}
+	}
+	if err := s.store.UpdateMedium(ctx, id, u); err != nil {
+		return Medium{}, s.storeError("saving the image", err)
+	}
+	row, err := s.store.Medium(ctx, id)
 	if err != nil {
-		return mediaRef{}, err
+		return Medium{}, s.storeError("reading the image", err)
+	}
+	ch := change{owner: row.Owner, id: id, medium: true, public: row.Public || u.Public != nil} // unpublishing reaches everyone too
+	s.hub.publish(ch)
+	s.log.Info("image updated", "by", a.Username, "id", id)
+	return s.toMedium(ctx, row, a, time.Now()), nil
+}
+
+// publishMedium tells the owner's (and, for public images, everyone's) streams about a change.
+func (s *Service) publishMedium(row store.Medium) {
+	s.hub.publish(change{owner: row.Owner, id: row.ID, medium: true, public: row.Public})
+}
+
+// resolveMedium is a Ready image the actor may make a machine from.
+func (s *Service) resolveMedium(ctx context.Context, a Actor, id string) (mediaRef, error) {
+	row, err := s.mediumRow(ctx, a, id, false)
+	if err != nil {
+		return mediaRef{}, refuse(http.StatusBadRequest, "There is no image %q.", id)
 	}
 	dv := s.dataVolume(ctx, row.ID)
 	if state, _, _ := mediumState(dv, row.Source == "upload", row.Profile != "", row.CreatedAt, time.Now()); state != "Ready" {
-		return mediaRef{}, refuse(http.StatusConflict, "That medium isn't ready.")
+		return mediaRef{}, refuse(http.StatusConflict, "That image isn't ready.")
 	}
-	return mediaRef{ID: row.ID, PVC: row.ID, Kind: row.Kind, Profile: row.Profile, PVCBytes: dvRequest(dv)}, nil
+	return mediaRef{ID: row.ID, Name: row.Name, CloudConfig: row.CloudConfig, PVC: row.ID, Kind: row.Kind, Profile: row.Profile, PVCBytes: dvRequest(dv)}, nil
 }
 
 func checkMediumName(name string) (string, error) {
@@ -269,11 +307,11 @@ func (s *Service) addMedium(ctx context.Context, row store.Medium, source cdiv1.
 	}
 	s.log.Info("medium added", "owner", row.Owner, "id", row.ID, "source", row.Source, "kind", row.Kind, "bytes", row.SizeBytes)
 	row.CreatedAt = time.Now()
-	return s.toMedium(ctx, row, time.Now()), nil
+	return s.toMedium(ctx, row, Actor{Owner: row.Owner}, time.Now()), nil
 }
 
 // AddUpload registers a medium the browser will upload: header is its first 64 KiB.
-func (s *Service) AddUpload(ctx context.Context, owner, name string, size int64, header []byte) (Medium, error) {
+func (s *Service) AddUpload(ctx context.Context, a Actor, name string, size int64, header []byte) (Medium, error) {
 	name, err := checkMediumName(name)
 	if err != nil {
 		return Medium{}, err
@@ -282,12 +320,12 @@ func (s *Service) AddUpload(ctx context.Context, owner, name string, size int64,
 	if err != nil || size <= 0 {
 		return Medium{}, refuse(http.StatusBadRequest, "That isn't an ISO or a disk image (qcow2, VMDK or raw).")
 	}
-	row := store.Medium{ID: newMediumID(), Owner: owner, Name: name, Source: "upload", Kind: r.Kind, SizeBytes: size, VirtualBytes: pvcBytes(r)}
+	row := store.Medium{ID: newMediumID(), Owner: a.Owner, Name: name, Source: "upload", Kind: r.Kind, SizeBytes: size, VirtualBytes: pvcBytes(r)}
 	return s.addMedium(ctx, row, cdiv1.DataVolumeSource{Upload: &cdiv1.DataVolumeSourceUpload{}}, r)
 }
 
 // AddURL registers a medium CDI downloads from url, after the probe Job read its header.
-func (s *Service) AddURL(ctx context.Context, owner, name, raw string) (Medium, error) {
+func (s *Service) AddURL(ctx context.Context, a Actor, name, raw string) (Medium, error) {
 	name, err := checkMediumName(name)
 	if err != nil {
 		return Medium{}, err
@@ -300,13 +338,13 @@ func (s *Service) AddURL(ctx context.Context, owner, name, raw string) (Medium, 
 	if err != nil {
 		return Medium{}, err
 	}
-	row := store.Medium{ID: newMediumID(), Owner: owner, Name: name, Source: "url", URL: u.String(), Kind: r.Kind, SizeBytes: r.SizeBytes, VirtualBytes: pvcBytes(r)}
+	row := store.Medium{ID: newMediumID(), Owner: a.Owner, Name: name, Source: "url", URL: u.String(), Kind: r.Kind, SizeBytes: r.SizeBytes, VirtualBytes: pvcBytes(r)}
 	return s.addMedium(ctx, row, cdiv1.DataVolumeSource{HTTP: &cdiv1.DataVolumeSourceHTTP{URL: u.String()}}, r)
 }
 
 // Upload streams an upload's body to CDI's upload proxy, once the DataVolume is ready for it.
-func (s *Service) Upload(ctx context.Context, owner, id string, body io.Reader, length int64) error {
-	row, err := s.ownMedium(ctx, owner, id)
+func (s *Service) Upload(ctx context.Context, a Actor, id string, body io.Reader, length int64) error {
+	row, err := s.mediumRow(ctx, a, id, true)
 	if err != nil {
 		return err
 	}
@@ -344,7 +382,7 @@ func (s *Service) Upload(ctx context.Context, owner, id string, body io.Reader, 
 		s.log.Warn("upload proxy", "id", id, "status", resp.StatusCode, "body", strings.TrimSpace(string(msg)))
 		return refuse(http.StatusBadGateway, "The cluster refused the upload.")
 	}
-	s.log.Info("medium uploaded", "owner", owner, "id", id, "bytes", length)
+	s.log.Info("image uploaded", "by", a.Username, "id", id, "bytes", length)
 	return nil
 }
 
@@ -385,8 +423,9 @@ func (s *Service) waitDataVolume(ctx context.Context, name string, phase cdiv1.D
 
 // DeleteMedium deletes one of the owner's media: its DataVolume, then its row. Machines made from
 // it keep their own copies.
-func (s *Service) DeleteMedium(ctx context.Context, owner, id string) error {
-	if _, err := s.ownMedium(ctx, owner, id); err != nil {
+func (s *Service) DeleteMedium(ctx context.Context, a Actor, id string) error {
+	row, err := s.mediumRow(ctx, a, id, true)
+	if err != nil {
 		return err
 	}
 	dv := &cdiv1.DataVolume{ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: s.Namespace}}
@@ -396,8 +435,8 @@ func (s *Service) DeleteMedium(ctx context.Context, owner, id string) error {
 	if err := s.store.DeleteMedium(ctx, id); err != nil {
 		return s.storeError("deleting the medium", err)
 	}
-	s.hub.publish(change{owner: owner, id: id, medium: true})
-	s.log.Info("medium deleted", "owner", owner, "id", id)
+	s.publishMedium(row)
+	s.log.Info("image deleted", "by", a.Username, "owner", row.Owner, "id", id)
 	return nil
 }
 
@@ -543,7 +582,7 @@ func (s *Service) inspected(j *batchv1.Job) {
 			return // the Job stays; the next change of it retries
 		}
 		s.log.Info("medium inspected", "id", id, "profile", profile, "label", r.Label)
-		s.hub.publish(change{owner: row.Owner, id: id, medium: true})
+		s.publishMedium(row)
 	}
 	s.write.Delete(ctx, j, client.PropagationPolicy(metav1.DeletePropagationBackground))
 }

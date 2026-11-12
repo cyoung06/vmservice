@@ -13,15 +13,18 @@ export const usageOf = (machines: readonly Machine[]): Resources => ({
 const Meter = ({ label, used, limit, format }: {
   readonly label: string;
   readonly used: number;
-  readonly limit: number;
+  /** null or missing: no limit. */
+  readonly limit: number | null | undefined;
   readonly format: (value: number) => string;
 }) => {
-  const share = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 100;
+  const unlimited = typeof limit !== "number";
+  const share = unlimited ? 0 : limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 100;
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface p-3">
       <div className="text-2xs font-medium uppercase tracking-wide text-foreground-quaternary">{label}</div>
       <div className="text-xs text-foreground-tertiary">
-        <span className="text-base font-semibold tabular-nums text-foreground">{format(used)}</span> of {format(limit)}
+        <span className="text-base font-semibold tabular-nums text-foreground">{format(used)}</span>{" "}
+        {unlimited ? "· no limit" : `of ${format(limit)}`}
       </div>
       <progress
         value={share}

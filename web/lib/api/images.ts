@@ -1,8 +1,8 @@
 import { ApiError, get, signedOutEvent } from "./http";
-import type { Medium } from "./types";
+import type { VmImage } from "./types";
 
-/** The caller's media and the shared ones, newest first. */
-export const loadMedia = (): Promise<Medium[]> => get<{ media: Medium[] }>("/api/media").then((body) => body.media);
+/** The caller's images and everyone's public ones (admins: all), newest first. */
+export const loadImages = (): Promise<VmImage[]> => get<{ images: VmImage[] }>("/api/images").then((body) => body.images);
 
 /** How many bytes of a file the server wants up front: they say what the file is (docs/api.md). */
 export const headerBytes = 64 * 1024;
@@ -24,13 +24,13 @@ export type Upload = {
 };
 
 /**
- * Streams file as the raw body of PUT /api/media/{id}/upload. XMLHttpRequest rather than fetch:
+ * Streams file as the raw body of PUT /api/images/{id}/upload. XMLHttpRequest rather than fetch:
  * only it reports upload progress. onProgress gets the bytes sent so far.
  */
 export const uploadFile = (id: string, file: File, onProgress: (sent: number) => void): Upload => {
   const xhr = new XMLHttpRequest();
   const done = new Promise<void>((resolve, reject) => {
-    xhr.open("PUT", `/api/media/${encodeURIComponent(id)}/upload`);
+    xhr.open("PUT", `/api/images/${encodeURIComponent(id)}/upload`);
     xhr.setRequestHeader("X-Requested-With", "XMLHttpRequest");
     xhr.setRequestHeader("Content-Type", "application/octet-stream");
     xhr.upload.onprogress = (event) => onProgress(event.loaded);
@@ -77,7 +77,7 @@ export const formatBytes = (bytes: number): string => {
   return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
 };
 
-export const kindLabel = (kind: Medium["kind"]): string =>
+export const kindLabel = (kind: VmImage["kind"]): string =>
   kind === "iso" ? "ISO installer" : kind === "disk" ? "Disk image" : "Unknown";
 
 export const profileLabels: Readonly<Record<string, string>> = {

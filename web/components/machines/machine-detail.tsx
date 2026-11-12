@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Details } from "@/components/data/details";
 import { PageHeader } from "@/components/layout/page-header";
@@ -14,11 +14,12 @@ import { TextInput } from "@/components/ui/text-input";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorText } from "@/components/ui/error-text";
 import { Icon } from "@/components/ui/icon";
-import { post, remove } from "@/lib/api/http";
+import { ApiError, get, post, remove } from "@/lib/api/http";
 import type { Machine } from "@/lib/api/types";
 import { formatCpu, formatMemory, formatTime } from "@/lib/formatting/format";
-import { profileLabel } from "@/lib/api/media";
+import { profileLabel } from "@/lib/api/images";
 import { useAction } from "@/lib/hooks/use-action";
+import { messageOf } from "@/lib/errors";
 import { sshCommand } from "@/lib/paths";
 import { classNames } from "@/lib/utilities/class-names";
 
@@ -157,16 +158,15 @@ const Actions = ({ machine }: { readonly machine: Machine }) => {
 
 type Tab = "overview" | "console";
 
+/** The account to sign in as: the owner's username on cloud-init machines. */
+const userOf = (machine: Machine): string => machine.user || machine.defaultUser || "";
+
 const Overview = ({ machine }: { readonly machine: Machine }) => {
   const { configuration } = useSession();
-  // ssh -J … user@<name> works when the name can be a host name and no other of the member's
-  // machines has it (the bastion's rule).
+  // A machine's name is its host name, unique across everyone: ssh -J … user@<name>.
   const { machines: mine } = useMachines();
-  const sshName =
-    /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(machine.name) &&
-    (mine ?? []).filter((other) => other.name.toLowerCase() === machine.name.toLowerCase()).length === 1
-      ? machine.name
-      : null;
+  const own = !machine.owner || (mine ?? []).some((other) => other.id === machine.id);
+  const user = userOf(machine);
   const windows = machine.profile === "windows";
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-y-auto">
@@ -192,12 +192,13 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
         <Section title="Details">
           <Details
             items={[
-              [machine.media ? "Media" : "Image", machine.imageName || machine.media || "—"],
+              ...(!own && machine.owner ? ([["Owner", machine.owner]] as [string, React.ReactNode][]) : []),
+              ["Image", machine.imageName || machine.media || "—"],
               ...(machine.profile ? ([["OS profile", profileLabel(machine.profile)]] as [string, React.ReactNode][]) : []),
               ["Size", `${formatCpu(machine.cpu)} · ${formatMemory(machine.memoryMiB)}`],
               ["Disk", `${machine.diskGiB} GiB`],
-              ...(machine.defaultUser
-                ? ([["User", <span key="user" className="font-mono text-xs">{machine.defaultUser}</span>]] as [string, React.ReactNode][])
+              ...(user && !windows
+                ? ([["User", <span key="user" className="font-mono text-xs">{user}</span>]] as [string, React.ReactNode][])
                 : []),
               ["Created", formatTime(machine.createdAt)],
               ["ID", <span key="id" className="font-mono text-xs">{machine.id}</span>],
@@ -208,7 +209,7 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
           {windows ? (
             <div className="flex flex-col gap-3 text-xs text-foreground-tertiary">
               <p>Sign in at the VNC console with the account you made during Windows Setup.</p>
-              {configuration.ssh ? (
+              {configuration.ssh && own ? (
                 <div className="flex flex-col gap-1.5">
                   <p>
                     For Remote Desktop: enable <span className="text-foreground-secondary">OpenSSH Server</span> in
@@ -216,7 +217,7 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
                     your RDP client to <span className="font-mono text-foreground-secondary">localhost</span>:
                   </p>
                   <CopyLine
-                    text={`${sshCommand(configuration.ssh, "<windows user>", sshName ?? machine.id)} -L 3389:localhost:3389`}
+                    text={`${sshCommand(configuration.ssh, "<windows user>", machine.name)} -L 3389:localhost:3389`}
                   />
                 </div>
               ) : null}
@@ -225,20 +226,21 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
           <div className="flex flex-col gap-3 text-xs text-foreground-tertiary">
             <p>
               On the console, sign in as{" "}
-              <span className="font-mono text-foreground-secondary">{machine.defaultUser || "the image's default user"}</span>{" "}
-              with the password you set when you made the machine, if you set one.
+              <span className="font-mono text-foreground-secondary">{user || "the image's account"}</span> with the password
+              set when the machine was made, if one was (only if the image runs cloud-init; an installed system uses the
+              account made during installation).
             </p>
-            {configuration.ssh ? (
+            {configuration.ssh && own ? (
               <div className="flex flex-col gap-1.5">
                 <p>
-                  With SSH, through the jump host, using a key you registered under{" "}
+                  With SSH, through the jump host to the machine&apos;s name; the machine signs you in with a key you
+                  registered under{" "}
                   <Link href="/keys/" className="text-foreground-secondary underline-offset-2 hover:underline">
-                    SSH keys
+                    Account
                   </Link>{" "}
-                  before the machine was made:
+                  before it was made (or the password):
                 </p>
-                <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser || "<user>", machine.id)} />
-                {sshName ? <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser || "<user>", sshName)} /> : null}
+                <CopyLine text={sshCommand(configuration.ssh, user || "<user>", machine.name)} />
               </div>
             ) : null}
           </div>
@@ -249,10 +251,48 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
   );
 };
 
+/**
+ * The machine: from the live list (own machines, and other members' an admin has seen). An admin
+ * opening another member's machine directly has it fetched once (GET /api/vms/{id}); its events
+ * keep it current from then on.
+ */
+const useMachine = (id: string): { readonly machine: Machine | null; readonly loading: boolean; readonly error: string | null } => {
+  const { user } = useSession();
+  const { machines, allMachines, put } = useMachines();
+  const known = allMachines.find((item) => item.id === id) ?? null;
+  const [fetched, setFetched] = useState<{ readonly id: string; readonly error: string | null } | null>(null);
+  const admin = user.admin === true;
+  const wanted = admin && machines !== null && !known && id !== "" && fetched?.id !== id;
+  useEffect(() => {
+    if (!wanted) {
+      return;
+    }
+    let cancelled = false;
+    void get<Machine>(`/api/vms/${encodeURIComponent(id)}`).then(
+      (machine) => {
+        if (!cancelled) {
+          put(machine);
+          setFetched({ id, error: null });
+        }
+      },
+      (failure: unknown) => {
+        if (!cancelled) {
+          setFetched({ id, error: failure instanceof ApiError && failure.status === 404 ? null : messageOf(failure) });
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [wanted, id, put]);
+  const loading = machines === null || (admin && !known && fetched?.id !== id);
+  return { machine: known, loading, error: fetched?.id === id ? fetched.error : null };
+};
+
 export const MachineDetail = () => {
+  const { user } = useSession();
   const id = useSearchParams().get("id") ?? "";
-  const { machines } = useMachines();
-  const machine = machines?.find((item) => item.id === id) ?? null;
+  const { machine, loading, error } = useMachine(id);
   const [tab, setTab] = useState<Tab>("overview");
 
   const tabButton = (value: Tab, label: string) => (
@@ -279,10 +319,14 @@ export const MachineDetail = () => {
         icon={<Icon name="server" size={15} />}
         breadcrumbs={["Machines"]}
       />
-      {machines === null ? (
+      {loading ? (
         <div className="mx-auto flex w-full max-w-[1080px] flex-col gap-4 px-4 py-5 md:px-8 md:py-8">
           <LiveNotice />
           <div className="py-12 text-center text-xs text-foreground-tertiary">Loading…</div>
+        </div>
+      ) : error && !machine ? (
+        <div className="mx-auto w-full max-w-[1080px] px-4 py-5 md:px-8 md:py-8">
+          <ErrorText message={error} />
         </div>
       ) : !machine ? (
         <EmptyState
@@ -301,6 +345,9 @@ export const MachineDetail = () => {
                   <h2 className="text-base font-semibold text-foreground [overflow-wrap:anywhere]">{machine.name}</h2>
                   <MachineStateBadge state={machine.state} />
                 </div>
+                {machine.owner && machine.owner !== user.username ? (
+                  <p className="text-xs text-foreground-tertiary">Owned by {machine.owner}</p>
+                ) : null}
                 {machine.detail ? (
                   <p className={classNames("text-xs", machine.state === "Error" ? "text-danger" : "text-foreground-tertiary")}>
                     {machine.detail}

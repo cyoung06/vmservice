@@ -68,6 +68,7 @@ func main() {
 	flag.StringVar(&a.ClientID, "oidc-client-id", "", "the OIDC client id (required)")
 	clientSecretFile := flag.String("oidc-client-secret-file", "", "file holding the OIDC client secret (required)")
 	flag.StringVar(&a.Group, "group", "", "group the ID token must list to sign in (empty: anyone the provider signs in)")
+	flag.StringVar(&a.AdminGroup, "admin-group", "", "group whose members are admins: every member's machines and images, quotas, no limits (empty: none)")
 	flag.StringVar(&a.GroupsClaim, "groups-claim", "groups", "the ID token claim with the user's groups")
 	flag.StringVar(&a.UsernameClaim, "username-claim", "preferred_username", "the ID token claim with the username")
 	flag.StringVar(&a.KeyFile, "session-key-file", "", "file holding the 32-byte session cookie key, raw or base64 (required)")
@@ -175,16 +176,16 @@ func main() {
 	}
 }
 
-// runBastion is "vmservice bastion": the SSH jump host, in a process of its own with only read
-// access (its database role can only read; its service account only reads VirtualMachineInstances).
+// runBastion is "vmservice bastion": the open SSH jump host (port 22 of machines, by name), in a
+// process of its own with only read access (its database role reads machines; its service account
+// only reads VirtualMachineInstances).
 func runBastion(log *slog.Logger, args []string) int {
 	fs := flag.NewFlagSet("bastion", flag.ExitOnError)
 	namespace := fs.String("namespace", "", "the machines' namespace (required)")
-	databaseURLFile := fs.String("database-url-file", "", "file holding the Postgres URL of a role that may read members, machines and ssh_keys (required)")
+	databaseURLFile := fs.String("database-url-file", "", "file holding the Postgres URL of a role that may read machines (required)")
 	listen := fs.String("listen", ":2222", "the SSH listen address")
 	hostKey := fs.String("host-key-file", "", "the host key, an OpenSSH private key file (required)")
-	lifetime := fs.Duration("session-lifetime", 7*24*time.Hour, "how long after a member's last sign-in their keys are honoured: the portal's -session-lifetime")
-	maxSessions := fs.Int("max-sessions", 8, "open SSH sessions per member")
+	maxSessions := fs.Int("max-sessions", 8, "open SSH sessions per source address")
 	fs.Parse(args)
 	for name, v := range map[string]string{"namespace": *namespace, "database-url-file": *databaseURLFile, "host-key-file": *hostKey} {
 		if v == "" {
@@ -210,12 +211,12 @@ func runBastion(log *slog.Logger, args []string) int {
 		log.Error("kubernetes config", "err", err)
 		return 1
 	}
-	lookup, err := machines.NewLookup(ctx, kube, *namespace, db, *lifetime, log)
+	lookup, err := machines.NewLookup(ctx, kube, *namespace, db, log)
 	if err != nil {
 		log.Error("lookup", "err", err)
 		return 1
 	}
-	b, err := bastion.New(*hostKey, lookup, &limit.PerOwner{Max: int64(*maxSessions)}, log)
+	b, err := bastion.New(*hostKey, lookup, &limit.PerOwner{Max: int64(*maxSessions)}, log) // per source address
 	if err != nil {
 		log.Error("bastion", "err", err)
 		return 1

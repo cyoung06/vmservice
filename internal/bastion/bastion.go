@@ -1,7 +1,7 @@
-// Package bastion is the SSH jump host: `ssh -J host:port user@vm-xxxxxx`. A member is whoever owns
-// the key they connect with (keys are registered in the portal, one member per key); the only thing
-// they may do is forward a connection to port 22 of a running machine of theirs. No shell, no other
-// hosts or ports, no remote forwarding.
+// Package bastion is the SSH jump host: `ssh -J host:port user@<machine name>`. It's open to anyone
+// (no authentication at the jump hop: the machine's own sshd signs people in, like a server with a
+// public SSH port), and the only thing it does is forward a connection to port 22 of a running
+// machine, by its name or id. No shell, no other hosts or ports, no remote forwarding.
 package bastion
 
 import (
@@ -19,15 +19,13 @@ import (
 
 // Machines is what the bastion asks of the machines service.
 type Machines interface {
-	// KeyOwner is the owner of a registered key and until when it's honoured.
-	KeyOwner(ctx context.Context, key ssh.PublicKey) (owner string, until time.Time, ok bool)
-	// Address is the address of the owner's running machine id.
-	Address(ctx context.Context, owner, id string) (string, error)
+	// Address is the address of a running machine, by name or id.
+	Address(ctx context.Context, host string) (string, error)
 }
 
-// Limiter caps each member's open long-lived connections (shared with the consoles).
+// Limiter caps open sessions per key (here: per source IP).
 type Limiter interface {
-	Take(owner string) (release func(), ok bool)
+	Take(key string) (release func(), ok bool)
 }
 
 // Bastion is the SSH server.
@@ -41,8 +39,6 @@ type Bastion struct {
 }
 
 const (
-	ownerExtension   = "vmservice-owner"
-	untilExtension   = "vmservice-until"
 	maxPending       = 64 // unauthenticated handshakes at once, for everyone
 	maxChannels      = 8  // forwards open at once in one session
 	handshakeTimeout = 30 * time.Second
@@ -62,22 +58,11 @@ func New(hostKeyFile string, m Machines, limit Limiter, log *slog.Logger) (*Bast
 	}
 	b := &Bastion{machines: m, limit: limit, log: log, dialPort: targetPort, pending: make(chan struct{}, maxPending)}
 	b.config = &ssh.ServerConfig{
-		PublicKeyCallback: b.authenticate,
-		ServerVersion:     "SSH-2.0-vmservice",
-		MaxAuthTries:      6,
+		NoClientAuth:  true, // the jump hop is open; the machine's sshd authenticates
+		ServerVersion: "SSH-2.0-vmservice",
 	}
 	b.config.AddHostKey(signer)
 	return b, nil
-}
-
-func (b *Bastion) authenticate(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	owner, until, ok := b.machines.KeyOwner(ctx, key)
-	if !ok {
-		return nil, errors.New("unknown key")
-	}
-	return &ssh.Permissions{Extensions: map[string]string{ownerExtension: owner, untilExtension: until.Format(time.RFC3339Nano)}}, nil
 }
 
 // Serve accepts connections on l until ctx ends. A failed Accept (e.g. out of file descriptors) is
@@ -120,21 +105,19 @@ func (b *Bastion) handle(ctx context.Context, conn net.Conn) {
 	}
 	defer sc.Close()
 	conn.SetDeadline(time.Time{})
-	owner := sc.Permissions.Extensions[ownerExtension]
-	until, _ := time.Parse(time.RFC3339Nano, sc.Permissions.Extensions[untilExtension])
-	release, ok := b.limit.Take(owner)
+	source, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	release, ok := b.limit.Take(source)
 	if !ok {
-		b.log.Info("bastion: too many connections", "owner", owner)
+		b.log.Info("bastion: too many sessions from one address", "source", source)
 		return
 	}
 	defer release()
-	// The session, and every forward in it, ends when the server stops, the client goes, or the
-	// owner's sign-in window closes (like a portal session).
-	session, cancel := context.WithDeadline(ctx, until)
+	// The session, and every forward in it, ends when the server stops or the client goes.
+	session, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(session, func() { sc.Close() })
 	defer stop()
-	b.log.Info("bastion: connected", "owner", owner, "remote", conn.RemoteAddr().String())
+	b.log.Info("bastion: connected", "source", source)
 
 	go ssh.DiscardRequests(reqs) // global requests (tcpip-forward, keepalives) are all answered no
 	open := make(chan struct{}, maxChannels)
@@ -145,7 +128,7 @@ func (b *Bastion) handle(ctx context.Context, conn net.Conn) {
 		}
 		select {
 		case open <- struct{}{}:
-			go func() { b.forward(session, owner, nc); <-open }()
+			go func() { b.forward(session, source, nc); <-open }()
 		default:
 			nc.Reject(ssh.ResourceShortage, "too many forwards in this session")
 		}
@@ -160,7 +143,7 @@ type directTCPIP struct {
 	OriginPort uint32
 }
 
-func (b *Bastion) forward(ctx context.Context, owner string, nc ssh.NewChannel) {
+func (b *Bastion) forward(ctx context.Context, source string, nc ssh.NewChannel) {
 	var req directTCPIP
 	if err := ssh.Unmarshal(nc.ExtraData(), &req); err != nil {
 		nc.Reject(ssh.ConnectionFailed, "bad request")
@@ -171,10 +154,10 @@ func (b *Bastion) forward(ctx context.Context, owner string, nc ssh.NewChannel) 
 		return
 	}
 	lookup, cancel := context.WithTimeout(ctx, 5*time.Second)
-	addr, err := b.machines.Address(lookup, owner, req.Host)
+	addr, err := b.machines.Address(lookup, req.Host)
 	cancel()
 	if err != nil {
-		message := "no such running machine of yours"
+		message := "no such running machine"
 		if isRefusal(err) {
 			message = err.Error()
 		}
@@ -193,7 +176,7 @@ func (b *Bastion) forward(ctx context.Context, owner string, nc ssh.NewChannel) 
 		return
 	}
 	go ssh.DiscardRequests(chReqs)
-	b.log.Info("bastion: forwarding", "owner", owner, "machine", req.Host)
+	b.log.Info("bastion: forwarding", "source", source, "machine", req.Host)
 	// Ends with the session even if the machine keeps its side open.
 	stop := context.AfterFunc(ctx, func() { target.Close(); ch.Close() })
 	defer stop()

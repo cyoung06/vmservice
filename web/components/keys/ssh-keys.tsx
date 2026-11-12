@@ -13,12 +13,94 @@ import { DialogFrame } from "@/components/ui/dialog-frame";
 import { ErrorText } from "@/components/ui/error-text";
 import { Icon } from "@/components/ui/icon";
 import { TextInput } from "@/components/ui/text-input";
-import { post, remove } from "@/lib/api/http";
-import type { NewKeyRequest, SshKey } from "@/lib/api/types";
+import { get, post, put, remove } from "@/lib/api/http";
+import type { Account, NewKeyRequest, SshKey } from "@/lib/api/types";
 import { formatTime } from "@/lib/formatting/format";
 import { useAction } from "@/lib/hooks/use-action";
 import { useResource } from "@/lib/hooks/use-resource";
 
+
+const loadAccount = (): Promise<Account> => get<Account>("/api/account");
+
+const uidMinimum = 1000;
+const uidMaximum = 60000;
+
+/** The account machines get: your username, and the UID you choose (or the distro's pick). */
+const AccountSection = () => {
+  const account = useResource(loadAccount);
+  const action = useAction();
+  // What the member typed; null: show the saved UID.
+  const [edited, setEdited] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const uid = edited ?? (account.data?.uid === null || account.data === null ? "" : String(account.data.uid));
+  const trimmed = uid.trim();
+  const value = trimmed === "" ? null : Number(trimmed);
+  const valid = value === null || (Number.isInteger(value) && value >= uidMinimum && value <= uidMaximum);
+  const changed = account.data !== null && value !== account.data.uid;
+  return (
+    <section className="flex flex-col gap-3">
+      <h2 className="text-[13px] font-medium text-foreground">Your account on machines</h2>
+      <ErrorText message={account.error} />
+      {account.data ? (
+        <form
+          className="flex flex-col gap-4 rounded-lg border border-border bg-surface p-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!valid || !changed) {
+              return;
+            }
+            setSaved(false);
+            void action
+              .run(() => put("/api/account", { uid: value }))
+              .then(async (done) => {
+                if (done) {
+                  setSaved(true);
+                  await account.reload();
+                  setEdited(null);
+                }
+              });
+          }}
+        >
+          <p className="text-xs text-foreground-tertiary">
+            Machines made from an image that runs cloud-init get an account named{" "}
+            <span className="font-mono text-foreground-secondary">{account.data.username}</span> with sudo, your keys below
+            and the password you set for the machine. A change here applies to machines you make afterwards.
+          </p>
+          <FormField
+            label="UID"
+            htmlFor="account-uid"
+            hint={`${uidMinimum}–${uidMaximum}, the same on all your machines (handy for shared files); empty lets each distro pick.`}
+          >
+            <TextInput
+              id="account-uid"
+              type="number"
+              inputMode="numeric"
+              min={uidMinimum}
+              max={uidMaximum}
+              step={1}
+              value={uid}
+              placeholder="chosen by the distro"
+              onChange={(event) => {
+                setEdited(event.target.value);
+                setSaved(false);
+              }}
+              aria-invalid={!valid || undefined}
+            />
+          </FormField>
+          <div className="flex flex-wrap items-center gap-3">
+            <Button type="submit" variant="primary" disabled={!valid || !changed} pending={action.pending}>
+              Save
+            </Button>
+            <ErrorText message={action.error} />
+            {saved ? <span className="text-xs text-success">Saved.</span> : null}
+          </div>
+        </form>
+      ) : account.error ? null : (
+        <div className="py-6 text-center text-xs text-foreground-tertiary">Loading…</div>
+      )}
+    </section>
+  );
+};
 
 /** The most keys a member may register (docs/api.md). */
 const keyMaximum = 20;
@@ -117,31 +199,32 @@ const DeleteKey = ({
       }
     >
       <p className="text-[13px] text-foreground-secondary">
-        The jump host stops accepting it for new connections right away; connections already open
-        stay until they close. Machines you already made keep it in their authorized keys; remove it
-        there yourself if you need to.
+        Machines you make from now on won&apos;t get it. Machines you already made keep it in their
+        authorized keys; remove it there yourself if you need to.
       </p>
     </DialogFrame>
   );
 };
 
-/** The member's SSH keys: added to machines made from now on, and accepted by the jump host. */
+/** The member's account and SSH keys: what machines made from now on get. */
 export const SshKeys = () => {
-  const { configuration } = useSession();
+  const { configuration, user } = useSession();
   const keys = useResource(loadKeys);
   const [deleting, setDeleting] = useState<SshKey | null>(null);
 
   return (
     <>
-      <PageHeader title="SSH keys" icon={<Icon name="key" size={15} />} />
+      <PageHeader title="Account" icon={<Icon name="user" size={15} />} />
       <div className="scrollbar-thin min-h-0 min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-[880px] flex-col gap-6 px-4 py-5 md:px-8 md:py-8">
+          <AccountSection />
           <div className="flex flex-col gap-2 text-xs text-foreground-tertiary">
+            <h2 className="text-[13px] font-medium text-foreground">SSH keys</h2>
             <p>
-              Keys you add here go into every machine you create afterwards; machines you already made keep the keys they
-              had. They also let you through the jump host, which only forwards to your own machines.
+              Keys you add here go into every machine you create afterwards (for your account on it); machines you already
+              made keep the keys they had. To reach a machine, SSH through the jump host to its name:
             </p>
-            {configuration.ssh ? <CopyLine text={sshCommand(configuration.ssh, "<user>", "<machine id>")} /> : null}
+            {configuration.ssh ? <CopyLine text={sshCommand(configuration.ssh, user.username, "<machine>")} /> : null}
           </div>
 
           <section className="flex flex-col gap-3">

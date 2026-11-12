@@ -34,7 +34,9 @@ type Config struct {
 	// Origin + /auth/callback.
 	Origin string
 	// Group must be in the ID token's GroupsClaim; empty: anyone the provider signs in.
-	Group         string
+	Group string
+	// AdminGroup in the groups makes the session an admin's; empty: no admins.
+	AdminGroup    string
 	GroupsClaim   string
 	UsernameClaim string
 	KeyFile       string
@@ -50,6 +52,7 @@ type Session struct {
 	// machines are labeled with. A username can be freed and signed up again; sub can't.
 	Owner    string    `json:"o"`
 	Username string    `json:"u"` // for display
+	Admin    bool      `json:"a,omitempty"`
 	Expires  time.Time `json:"e"`
 }
 
@@ -98,6 +101,7 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Auth, error) {
 	}
 	origin := cfg.Origin
 	cfg.Group = strings.TrimPrefix(cfg.Group, "/") // Keycloak shows groups as paths; the claim's are trimmed too
+	cfg.AdminGroup = strings.TrimPrefix(cfg.AdminGroup, "/")
 	return &Auth{
 		cfg: cfg,
 		oauth: oauth2.Config{
@@ -233,7 +237,8 @@ func (a *Auth) callback(w http.ResponseWriter, r *http.Request) {
 		a.refuse(w, http.StatusForbidden, fmt.Sprintf("%s isn't in the group %q, which this service requires.", user, a.cfg.Group))
 		return
 	}
-	s := Session{Owner: OwnerID(a.cfg.Issuer, idToken.Subject), Username: user, Expires: time.Now().Add(a.cfg.Lifetime).Truncate(time.Second)}
+	s := Session{Owner: OwnerID(a.cfg.Issuer, idToken.Subject), Username: user, Expires: time.Now().Add(a.cfg.Lifetime).Truncate(time.Second),
+		Admin: a.cfg.AdminGroup != "" && slices.Contains(groups, a.cfg.AdminGroup)}
 	if a.cfg.OnSignIn != nil {
 		if err := a.cfg.OnSignIn(ctx, s.Owner, s.Username); err != nil {
 			a.log.Error("sign-in hook", "user", user, "err", err)

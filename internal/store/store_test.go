@@ -44,7 +44,7 @@ func stores(t *testing.T) map[string]Store {
 	return out
 }
 
-func limit2(u Usage) error {
+func limit2(u Usage, _ Quota) error {
 	if u.VMs >= 2 {
 		return &LimitError{"over"}
 	}
@@ -74,16 +74,16 @@ func TestMachines(t *testing.T) {
 			if u, _ := s.Usage(ctx, "alice"); u != (Usage{VMs: 1, CPU: 2, MemoryMiB: 2048, DiskGiB: 20}) {
 				t.Errorf("usage = %+v", u)
 			}
-			if named, _ := s.MachinesNamed(ctx, "alice", "BOX"); len(named) != 1 || named[0].ID != "vm-aaaaaa" {
-				t.Errorf("named BOX = %+v", named)
+			if byName, err := s.MachineByName(ctx, "box"); err != nil || byName.ID != "vm-aaaaaa" || byName.OwnerName != "alice" {
+				t.Errorf("by name = %+v, %v", byName, err)
 			}
-			if named, _ := s.MachinesNamed(ctx, "bob", "box"); len(named) != 0 {
-				t.Errorf("bob finds alice's box: %+v", named)
+			if err := s.CreateMachine(ctx, Machine{ID: "vm-zzzzzz", Owner: "bob", Name: "box"}, limit2); !errors.Is(err, ErrExists) {
+				t.Errorf("a second machine named box = %v, want ErrExists (names are unique)", err)
 			}
 			if list, _ := s.Machines(ctx, "bob"); len(list) != 0 {
 				t.Errorf("bob sees %v", list)
 			}
-			if err := s.CreateMachine(ctx, Machine{ID: "vm-bbbbbb", Owner: "nobody", Name: "x"}, limit2); err == nil {
+			if err := s.CreateMachine(ctx, Machine{ID: "vm-bbbbbb", Owner: "nobody", Name: "nobodys"}, limit2); err == nil {
 				t.Error("a machine for a non-member was created")
 			}
 			s.DeleteMachine(ctx, "vm-aaaaaa")
@@ -105,7 +105,7 @@ func TestLimitHoldsUnderConcurrency(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					s.CreateMachine(ctx, Machine{ID: fmt.Sprintf("vm-c%05d", i), Owner: "carol", Name: "x", CPU: 1, MemoryMiB: 1, DiskGiB: 1}, limit2)
+					s.CreateMachine(ctx, Machine{ID: fmt.Sprintf("vm-c%05d", i), Owner: "carol", Name: fmt.Sprintf("c%d", i), CPU: 1, MemoryMiB: 1, DiskGiB: 1}, limit2)
 				}()
 			}
 			wg.Wait()
@@ -215,7 +215,7 @@ func TestMedia(t *testing.T) {
 				t.Errorf("bob sees %v", list)
 			}
 			mm := Machine{ID: "vm-mmmmmm", Owner: "alice", Name: "w", Media: "md-aaaaaa", Profile: "windows"}
-			if err := s.CreateMachine(ctx, mm, func(Usage) error { return nil }); err != nil {
+			if err := s.CreateMachine(ctx, mm, func(Usage, Quota) error { return nil }); err != nil {
 				t.Fatal(err)
 			}
 			if got, _ := s.Machine(ctx, "vm-mmmmmm"); got.Media != "md-aaaaaa" || got.Profile != "windows" {
@@ -224,6 +224,47 @@ func TestMedia(t *testing.T) {
 			s.DeleteMedium(ctx, "md-aaaaaa")
 			if _, err := s.Medium(ctx, "md-aaaaaa"); !errors.Is(err, ErrNotFound) {
 				t.Errorf("after delete = %v", err)
+			}
+		})
+	}
+}
+
+func TestMembersQuotaPublic(t *testing.T) {
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s.UpsertMember(ctx, "alice", "alice")
+			s.UpsertMember(ctx, "bob", "bob")
+			three, uid := 3, 10001
+			if err := s.SetQuota(ctx, "alice", Quota{VMs: &three}); err != nil {
+				t.Fatal(err)
+			}
+			s.SetUID(ctx, "alice", &uid)
+			m, err := s.Member(ctx, "alice")
+			if err != nil || m.Quota.VMs == nil || *m.Quota.VMs != 3 || m.Quota.CPU != nil || m.UID == nil || *m.UID != 10001 {
+				t.Errorf("member = %+v, %v", m, err)
+			}
+			var seen Quota
+			s.CreateMachine(ctx, Machine{ID: "vm-qqqqqq", Owner: "alice", Name: "q"}, func(_ Usage, q Quota) error { seen = q; return nil })
+			if seen.VMs == nil || *seen.VMs != 3 {
+				t.Errorf("CreateMachine saw quota %+v", seen)
+			}
+			if err := s.SetQuota(ctx, "nobody", Quota{}); !errors.Is(err, ErrNotFound) {
+				t.Errorf("quota for a non-member = %v", err)
+			}
+			s.AddMedium(ctx, Medium{ID: "md-pppppp", Owner: "bob", Name: "Fedora", Source: "url", Kind: "disk", SizeBytes: 1, VirtualBytes: 1})
+			if pub, _ := s.PublicMedia(ctx); len(pub) != 0 {
+				t.Errorf("public before publishing = %v", pub)
+			}
+			yes := true
+			s.UpdateMedium(ctx, "md-pppppp", MediumUpdate{Public: &yes, CloudConfig: map[string]any{"packages": []any{"git"}}})
+			s.UpdateMedium(ctx, "md-pppppp", MediumUpdate{}) // nil fields change nothing
+			pub, _ := s.PublicMedia(ctx)
+			if len(pub) != 1 || pub[0].OwnerName != "bob" || pub[0].CloudConfig["packages"] == nil {
+				t.Errorf("public = %+v", pub)
+			}
+			if all, _ := s.Members(ctx); len(all) != 2 {
+				t.Errorf("members = %+v", all)
 			}
 		})
 	}

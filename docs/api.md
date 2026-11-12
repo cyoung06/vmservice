@@ -182,3 +182,67 @@ Machines from media:
 
 `POST /api/vms/{id}/eject` → `204`: removes the CD-ROMs (the ISO and the driver CD) so the machine boots
 from its disk; it restarts if it's running.
+
+## v0.6: images, presets, admin (supersedes the image/media split above)
+
+**Images.** Everything a machine is made from is an *image* (the Media endpoints, under their new
+name): an ISO or a disk image, uploaded or imported from a URL, owned by a member, optionally
+**public**. The catalog no longer lists images; `GET /api/catalog` has no `images`, and
+`POST /api/vms` takes `{"name", "image", "profile"?, "size", "diskGiB", "password"}` where `image` is an
+image id (`md-…`). The old `/api/media` paths stay as aliases of `/api/images`.
+
+An image (as a medium before, plus):
+
+```json
+{
+  "owner": "alice",              // the owner's username (for public images and admins)
+  "mine": true,                  // the caller owns it
+  "public": true,
+  "cloudConfig": {"apt": {}},    // extras merged into machines' #cloud-config (a "preset"); {} if none
+}
+```
+
+| | |
+| --- | --- |
+| `GET /api/images` | `{"images": [...]}`: the caller's, then everyone's public ones (admins: all) |
+| `PATCH /api/images/{id}` | owner or admin: body any of `{"name", "public", "cloudConfig"}` → image. `cloudConfig` is an object; keys VMService sets itself (`hostname`, `users`, `chpasswd`, `ssh_pwauth`, `ssh_authorized_keys`) are refused (`400`) |
+| `DELETE /api/images/{id}` | owner or admin |
+
+Events: `image` / `image-deleted` (the old `medium` / `medium-deleted` names are gone).
+
+**Your account on machines.** Every machine made from a disk image (or a Linux ISO) gets an
+account named after your username, with your SSH keys, your password if you set one, passwordless
+sudo and bash (cloud-init `users:`), so `ssh -J … <username>@<machine>` works on every distro whose
+image runs cloud-init. Windows: none (Setup makes the account).
+
+| | |
+| --- | --- |
+| `GET /api/account` | `{"username": "alice", "uid": 10001 \| null}` |
+| `PUT /api/account` | `{"uid": 10001 \| null}` (1000–60000; null: the distro picks): used for machines made afterwards |
+
+Machines carry `"user": "alice"` (the account to sign in as) instead of `defaultUser` (kept, = user).
+Password: optional with an SSH key, required without one, as before; not for Windows ISOs.
+
+**Admin** (the session's `"admin": true` in `GET /api/session`, from the OIDC group configured as
+admins). Admins:
+- `GET /api/admin/vms` → `{"vms": [machine + "owner"...]}` (every member's), and every machine
+  endpoint (`GET`, actions, `DELETE`, consoles, eject) works on any machine for them;
+- `GET /api/admin/members` → `{"members": [{"owner", "username", "usage", "quota", "signedInAt"}]}`
+  where `quota` is `{"vms", "cpu", "memoryMiB", "diskGiB"}` with `null` fields meaning the default;
+- `PUT /api/admin/members/{owner}/quota` → body the quota (nulls: default) → `204`;
+- see, edit and delete every image, and make any public;
+- have no limits themselves.
+`GET /api/catalog` also returns `"limits"` = the caller's effective quota. Admins also get every
+machine's events (`vm` events of other members' machines carry `"owner"`).
+
+### v0.6 addendum: machine names are hostnames; the bastion is open
+
+- A machine's `name` is its hostname: a DNS label (lowercase letters, digits, `-`; 1–63; not
+  starting or ending with `-`; not of the form `vm-xxxxxx`), unique across all members. It's set at
+  create and used as the VM's hostname. `POST /api/vms` answers `409` when it's taken.
+- `GET /api/names/{name}` → `{"available": true|false, "reason": "..."}` for the create form (reason
+  when not available: invalid or taken).
+- The bastion takes anyone: `ssh -J <host>:<port> <user>@<machine name>` (or the machine id). It
+  doesn't check keys at the jump hop; the machine's own sshd signs you in (your account and keys from
+  cloud-init). SSH keys registered in the portal are what new machines get; they no longer matter
+  to the jump hop.

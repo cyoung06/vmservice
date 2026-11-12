@@ -34,7 +34,9 @@ type Machine struct {
 	Name         string    `json:"name"`
 	Image        string    `json:"image"`
 	ImageName    string    `json:"imageName"`
-	DefaultUser  string    `json:"defaultUser"`
+	DefaultUser  string    `json:"defaultUser"` // = User, for older clients
+	User         string    `json:"user"`        // the account to sign in as ("" for Windows)
+	Owner        string    `json:"owner"`       // the owner's username
 	Size         string    `json:"size"`
 	CPU          int       `json:"cpu"`
 	MemoryMiB    int       `json:"memoryMiB"`
@@ -49,11 +51,11 @@ type Machine struct {
 
 // Request is what a member asks for in POST /api/vms, after checking.
 type Request struct {
-	Name string
-	// OwnerName is the member's username, kept as an annotation for admins (the owner label is
-	// their stable id, which says nothing to a person).
+	Name string // the hostname, unique across everyone
+	// OwnerName is the member's username: their account on the machine, and an annotation for
+	// admins (the owner label is their stable id, which says nothing to a person).
 	OwnerName string
-	Image     config.Image
+	UID       *int // the account's uid, nil: the distro picks
 	Size      config.Size
 	DiskGiB   int
 	// PasswordHash is the SHA-512 crypt hash of the default user's password; empty: none (the user
@@ -61,11 +63,12 @@ type Request struct {
 	PasswordHash string
 	// AuthorizedKeys are the default user's SSH keys (authorized_keys lines); filled by Create.
 	AuthorizedKeys []string
-	// MediaID and ProfileOverride make the machine from a medium instead of Image.
+	// MediaID is the image it's made from; ProfileOverride replaces the image's detected profile.
 	MediaID         string
 	ProfileOverride string
 	media           *mediaRef // resolved by Create
-	profile         string    // the profile it gets
+	cloudExtras     map[string]any
+	profile         string // the profile it gets
 	driversImage    string
 }
 
@@ -126,7 +129,7 @@ func buildVM(namespace, id, owner, storageClass string, r Request) *kubevirtv1.V
 			DataVolumeTemplates: []kubevirtv1.DataVolumeTemplateSpec{{
 				ObjectMeta: metav1.ObjectMeta{Name: diskName(id), Labels: labels},
 				Spec: cdiv1.DataVolumeSpec{
-					Source:  &cdiv1.DataVolumeSource{PVC: &cdiv1.DataVolumeSourcePVC{Namespace: namespace, Name: r.Image.Source}},
+					Source:  &cdiv1.DataVolumeSource{Blank: &cdiv1.DataVolumeBlankImage{}}, // applyMedia sets the real source
 					Storage: storage,
 				},
 			}},
@@ -165,26 +168,38 @@ func buildVM(namespace, id, owner, storageClass string, r Request) *kubevirtv1.V
 	return vm
 }
 
-// cloudConfig is the machine's #cloud-config: the image's extras, then what the service sets,
-// which wins: the hostname, the default user's password (as a hash) and no SSH password logins.
-func cloudConfig(id string, r Request) ([]byte, error) {
+// Keys VMService sets in a machine's #cloud-config itself; an image's extras can't touch them.
+var reservedCloudKeys = []string{"hostname", "fqdn", "users", "user", "chpasswd", "password", "ssh_pwauth", "ssh_authorized_keys", "disable_root"}
+
+// cloudConfig is the machine's #cloud-config: the image's extras, then what the service sets: the
+// hostname, and the member's own account (their username, uid if set, SSH keys, password hash,
+// passwordless sudo, bash) next to the image's default one. No SSH password logins.
+func cloudConfig(hostname string, r Request) ([]byte, error) {
 	doc := map[string]any{}
-	for k, v := range r.Image.CloudConfig {
+	for k, v := range r.cloudExtras {
 		doc[k] = v
 	}
-	doc["hostname"] = id
+	for _, k := range reservedCloudKeys {
+		delete(doc, k)
+	}
+	doc["hostname"] = hostname
 	doc["ssh_pwauth"] = false
-	delete(doc, "ssh_authorized_keys") // only the member's own keys, never the image's extras
+	user := map[string]any{
+		"name":        r.OwnerName,
+		"shell":       "/bin/bash",
+		"sudo":        "ALL=(ALL) NOPASSWD:ALL",
+		"lock_passwd": r.PasswordHash == "",
+	}
+	if r.PasswordHash != "" {
+		user["passwd"] = r.PasswordHash
+	}
+	if r.UID != nil {
+		user["uid"] = *r.UID
+	}
 	if len(r.AuthorizedKeys) > 0 {
-		doc["ssh_authorized_keys"] = r.AuthorizedKeys
+		user["ssh_authorized_keys"] = r.AuthorizedKeys
 	}
-	delete(doc, "chpasswd") // the member's password or none, never the image's extras
-	if r.PasswordHash != "" && r.Image.DefaultUser != "" {
-		doc["chpasswd"] = map[string]any{
-			"expire": false,
-			"users":  []any{map[string]any{"name": r.Image.DefaultUser, "password": r.PasswordHash, "type": "hash"}},
-		}
-	}
+	doc["users"] = []any{"default", user}
 	body, err := yaml.Marshal(doc)
 	if err != nil {
 		return nil, err
@@ -213,14 +228,14 @@ const missingGrace = 2 * time.Minute
 
 // toMachine is the API's view of a machine: its row, and its VM if it exists. disk is its root
 // DataVolume, if known (for clone progress).
-func toMachine(row store.Machine, vm *kubevirtv1.VirtualMachine, disk *cdiv1.DataVolume, catalog *config.Catalog, now time.Time) Machine {
+func toMachine(row store.Machine, vm *kubevirtv1.VirtualMachine, disk *cdiv1.DataVolume, now time.Time) Machine {
 	m := Machine{
-		ID: row.ID, Name: row.Name, Image: row.Image, ImageName: row.Image, Size: row.Size,
+		ID: row.ID, Name: row.Name, Image: row.Media, ImageName: row.Image, Size: row.Size,
 		CPU: row.CPU, MemoryMiB: row.MemoryMiB, DiskGiB: row.DiskGiB, CreatedAt: row.CreatedAt.UTC(),
-		Media: row.Media, Profile: row.Profile, InstallMedia: hasInstallMedia(vm),
+		Media: row.Media, Profile: row.Profile, InstallMedia: hasInstallMedia(vm), Owner: row.OwnerName,
 	}
-	if img, ok := catalog.Image(m.Image); ok {
-		m.ImageName, m.DefaultUser = img.Name, img.DefaultUser
+	if row.Profile != "windows" {
+		m.User, m.DefaultUser = row.OwnerName, row.OwnerName
 	}
 	switch {
 	case vm != nil:

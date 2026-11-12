@@ -32,9 +32,34 @@ type Machine struct {
 	CPU       int
 	MemoryMiB int
 	DiskGiB   int
-	Media     string // the media it was made from, "" for a catalog image
-	Profile   string // the device profile it got from its media
+	Media     string // the image it was made from ("" for machines from before images)
+	Profile   string // the device profile it got from its image
 	CreatedAt time.Time
+	OwnerName string // the owner's username (read only, from members)
+}
+
+// Quota is a member's limits; nil fields mean the default.
+type Quota struct {
+	VMs       *int `json:"vms"`
+	CPU       *int `json:"cpu"`
+	MemoryMiB *int `json:"memoryMiB"`
+	DiskGiB   *int `json:"diskGiB"`
+}
+
+// Member is a member's row.
+type Member struct {
+	Owner      string
+	Username   string
+	UID        *int
+	Quota      Quota
+	SignedInAt time.Time
+}
+
+// MediumUpdate changes some of an image's fields (nil: unchanged).
+type MediumUpdate struct {
+	Name        *string
+	Public      *bool
+	CloudConfig map[string]any
 }
 
 // Medium is a member's ISO or disk image (the data is a DataVolume named ID).
@@ -48,7 +73,10 @@ type Medium struct {
 	Profile      string // "" until the inspector ran
 	SizeBytes    int64
 	VirtualBytes int64
+	Public       bool
+	CloudConfig  map[string]any // extras merged into machines' #cloud-config
 	CreatedAt    time.Time
+	OwnerName    string // read only, from members
 }
 
 // Key is an SSH public key.
@@ -90,11 +118,19 @@ type Store interface {
 	SignedInAt(ctx context.Context, owner string) (time.Time, error)
 	// CreateMachine inserts m if the owner's machines plus m stay within check's limits; check
 	// returns a *LimitError when they wouldn't.
-	CreateMachine(ctx context.Context, m Machine, check func(Usage) error) error
+	CreateMachine(ctx context.Context, m Machine, check func(Usage, Quota) error) error
+	// MachineByName is the machine named name (names are unique across everyone).
+	MachineByName(ctx context.Context, name string) (Machine, error)
+	AllMachines(ctx context.Context) ([]Machine, error)
+	Member(ctx context.Context, owner string) (Member, error)
+	Members(ctx context.Context) ([]Member, error)
+	SetUID(ctx context.Context, owner string, uid *int) error
+	SetQuota(ctx context.Context, owner string, q Quota) error
+	PublicMedia(ctx context.Context) ([]Medium, error)
+	AllMedia(ctx context.Context) ([]Medium, error)
+	UpdateMedium(ctx context.Context, id string, u MediumUpdate) error
 	Machine(ctx context.Context, id string) (Machine, error)
 	Machines(ctx context.Context, owner string) ([]Machine, error)
-	// MachinesNamed is the owner's machines whose display name is name, ignoring case.
-	MachinesNamed(ctx context.Context, owner, name string) ([]Machine, error)
 	Usage(ctx context.Context, owner string) (Usage, error)
 	DeleteMachine(ctx context.Context, id string) error
 	// AddKey inserts k if the owner has fewer than max keys; ErrExists if anyone has it.
@@ -232,13 +268,17 @@ func scanUsage(row pgx.Row) (Usage, error) {
 	return u, err
 }
 
-func (p *Postgres) CreateMachine(ctx context.Context, m Machine, check func(Usage) error) error {
+func (p *Postgres) CreateMachine(ctx context.Context, m Machine, check func(Usage, Quota) error) error {
 	return p.serializable(ctx, func(tx pgx.Tx) error {
 		u, err := scanUsage(tx.QueryRow(ctx, usageQuery, m.Owner))
 		if err != nil {
 			return err
 		}
-		if err := check(u); err != nil {
+		var q Quota
+		if err := tx.QueryRow(ctx, `SELECT quota_vms, quota_cpu, quota_memory_mib, quota_disk_gib FROM members WHERE owner = $1`, m.Owner).Scan(&q.VMs, &q.CPU, &q.MemoryMiB, &q.DiskGiB); err != nil {
+			return err
+		}
+		if err := check(u, q); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO machines (id, owner, name, image, size, cpu, memory_mib, disk_gib, media, profile) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
@@ -250,11 +290,12 @@ func (p *Postgres) CreateMachine(ctx context.Context, m Machine, check func(Usag
 	})
 }
 
-const machineColumns = `id, owner, name, image, size, cpu, memory_mib, disk_gib, media, profile, created_at`
+const machineSelect = `SELECT m.id, m.owner, m.name, m.image, m.size, m.cpu, m.memory_mib, m.disk_gib, m.media, m.profile, m.created_at, coalesce(u.username, '')
+	FROM machines m LEFT JOIN members u ON u.owner = m.owner `
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
-	err := row.Scan(&m.ID, &m.Owner, &m.Name, &m.Image, &m.Size, &m.CPU, &m.MemoryMiB, &m.DiskGiB, &m.Media, &m.Profile, &m.CreatedAt)
+	err := row.Scan(&m.ID, &m.Owner, &m.Name, &m.Image, &m.Size, &m.CPU, &m.MemoryMiB, &m.DiskGiB, &m.Media, &m.Profile, &m.CreatedAt, &m.OwnerName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
 	}
@@ -262,23 +303,64 @@ func scanMachine(row pgx.Row) (Machine, error) {
 }
 
 func (p *Postgres) Machine(ctx context.Context, id string) (Machine, error) {
-	return scanMachine(p.pool.QueryRow(ctx, `SELECT `+machineColumns+` FROM machines WHERE id = $1`, id))
+	return scanMachine(p.pool.QueryRow(ctx, machineSelect+`WHERE m.id = $1`, id))
 }
 
 func (p *Postgres) Machines(ctx context.Context, owner string) ([]Machine, error) {
-	rows, err := p.pool.Query(ctx, `SELECT `+machineColumns+` FROM machines WHERE owner = $1 ORDER BY created_at DESC`, owner)
+	return p.machines(ctx, machineSelect+`WHERE m.owner = $1 ORDER BY m.created_at DESC`, owner)
+}
+
+func (p *Postgres) machines(ctx context.Context, sql string, args ...any) ([]Machine, error) {
+	rows, err := p.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Machine, error) { return scanMachine(r) })
 }
 
-func (p *Postgres) MachinesNamed(ctx context.Context, owner, name string) ([]Machine, error) {
-	rows, err := p.pool.Query(ctx, `SELECT `+machineColumns+` FROM machines WHERE owner = $1 AND lower(name) = lower($2) ORDER BY created_at DESC`, owner, name)
+func (p *Postgres) MachineByName(ctx context.Context, name string) (Machine, error) {
+	return scanMachine(p.pool.QueryRow(ctx, machineSelect+`WHERE m.name = $1`, name))
+}
+
+func (p *Postgres) AllMachines(ctx context.Context) ([]Machine, error) {
+	return p.machines(ctx, machineSelect+`ORDER BY m.created_at DESC`)
+}
+
+const memberColumns = `owner, username, uid, quota_vms, quota_cpu, quota_memory_mib, quota_disk_gib, signed_in_at`
+
+func scanMember(row pgx.Row) (Member, error) {
+	var m Member
+	err := row.Scan(&m.Owner, &m.Username, &m.UID, &m.Quota.VMs, &m.Quota.CPU, &m.Quota.MemoryMiB, &m.Quota.DiskGiB, &m.SignedInAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return m, ErrNotFound
+	}
+	return m, err
+}
+
+func (p *Postgres) Member(ctx context.Context, owner string) (Member, error) {
+	return scanMember(p.pool.QueryRow(ctx, `SELECT `+memberColumns+` FROM members WHERE owner = $1`, owner))
+}
+
+func (p *Postgres) Members(ctx context.Context) ([]Member, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+memberColumns+` FROM members ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Machine, error) { return scanMachine(r) })
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Member, error) { return scanMember(r) })
+}
+
+func (p *Postgres) SetUID(ctx context.Context, owner string, uid *int) error {
+	_, err := p.pool.Exec(ctx, `UPDATE members SET uid = $2 WHERE owner = $1`, owner, uid)
+	return err
+}
+
+func (p *Postgres) SetQuota(ctx context.Context, owner string, q Quota) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE members SET quota_vms = $2, quota_cpu = $3, quota_memory_mib = $4, quota_disk_gib = $5 WHERE owner = $1`,
+		owner, q.VMs, q.CPU, q.MemoryMiB, q.DiskGiB)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return err
 }
 
 func (p *Postgres) Usage(ctx context.Context, owner string) (Usage, error) {
@@ -338,11 +420,12 @@ func (p *Postgres) DeleteKey(ctx context.Context, owner, id string) error {
 	return err
 }
 
-const mediumColumns = `id, owner, name, source, url, kind, profile, size_bytes, virtual_bytes, created_at`
+const mediumSelect = `SELECT d.id, d.owner, d.name, d.source, d.url, d.kind, d.profile, d.size_bytes, d.virtual_bytes, d.public, d.cloud_config, d.created_at, coalesce(u.username, '')
+	FROM media d LEFT JOIN members u ON u.owner = d.owner `
 
 func scanMedium(row pgx.Row) (Medium, error) {
 	var m Medium
-	err := row.Scan(&m.ID, &m.Owner, &m.Name, &m.Source, &m.URL, &m.Kind, &m.Profile, &m.SizeBytes, &m.VirtualBytes, &m.CreatedAt)
+	err := row.Scan(&m.ID, &m.Owner, &m.Name, &m.Source, &m.URL, &m.Kind, &m.Profile, &m.SizeBytes, &m.VirtualBytes, &m.Public, &m.CloudConfig, &m.CreatedAt, &m.OwnerName)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
 	}
@@ -350,8 +433,11 @@ func scanMedium(row pgx.Row) (Medium, error) {
 }
 
 func (p *Postgres) AddMedium(ctx context.Context, m Medium) error {
-	_, err := p.pool.Exec(ctx, `INSERT INTO media (id, owner, name, source, url, kind, profile, size_bytes, virtual_bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		m.ID, m.Owner, m.Name, m.Source, m.URL, m.Kind, m.Profile, m.SizeBytes, m.VirtualBytes)
+	if m.CloudConfig == nil {
+		m.CloudConfig = map[string]any{}
+	}
+	_, err := p.pool.Exec(ctx, `INSERT INTO media (id, owner, name, source, url, kind, profile, size_bytes, virtual_bytes, public, cloud_config) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		m.ID, m.Owner, m.Name, m.Source, m.URL, m.Kind, m.Profile, m.SizeBytes, m.VirtualBytes, m.Public, m.CloudConfig)
 	if isUniqueViolation(err) {
 		return ErrExists
 	}
@@ -359,15 +445,40 @@ func (p *Postgres) AddMedium(ctx context.Context, m Medium) error {
 }
 
 func (p *Postgres) Medium(ctx context.Context, id string) (Medium, error) {
-	return scanMedium(p.pool.QueryRow(ctx, `SELECT `+mediumColumns+` FROM media WHERE id = $1`, id))
+	return scanMedium(p.pool.QueryRow(ctx, mediumSelect+`WHERE d.id = $1`, id))
 }
 
 func (p *Postgres) Media(ctx context.Context, owner string) ([]Medium, error) {
-	rows, err := p.pool.Query(ctx, `SELECT `+mediumColumns+` FROM media WHERE owner = $1 ORDER BY created_at DESC`, owner)
+	return p.media(ctx, mediumSelect+`WHERE d.owner = $1 ORDER BY d.created_at DESC`, owner)
+}
+
+func (p *Postgres) media(ctx context.Context, sql string, args ...any) ([]Medium, error) {
+	rows, err := p.pool.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Medium, error) { return scanMedium(r) })
+}
+
+func (p *Postgres) PublicMedia(ctx context.Context) ([]Medium, error) {
+	return p.media(ctx, mediumSelect+`WHERE d.public ORDER BY d.created_at DESC`)
+}
+
+func (p *Postgres) AllMedia(ctx context.Context) ([]Medium, error) {
+	return p.media(ctx, mediumSelect+`ORDER BY d.created_at DESC`)
+}
+
+func (p *Postgres) UpdateMedium(ctx context.Context, id string, u MediumUpdate) error {
+	var cloudConfig any // a nil map would be JSON null, not SQL NULL ("unchanged")
+	if u.CloudConfig != nil {
+		cloudConfig = u.CloudConfig
+	}
+	tag, err := p.pool.Exec(ctx, `UPDATE media SET name = coalesce($2, name), public = coalesce($3, public), cloud_config = coalesce($4, cloud_config) WHERE id = $1`,
+		id, u.Name, u.Public, cloudConfig)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return err
 }
 
 func (p *Postgres) SetMediumProfile(ctx context.Context, id, profile string, virtualBytes int64) error {

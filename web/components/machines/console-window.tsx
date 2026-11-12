@@ -44,7 +44,7 @@ export const ConsoleWindow = () => {
         <span className="flex-1" />
         {machine.data ? (
           <span className="hidden text-xs text-foreground-tertiary sm:inline">
-            Sign in as <span className="font-mono text-foreground-secondary">{machine.data.defaultUser}</span>
+            Sign in as <span className="font-mono text-foreground-secondary">{machine.data.user || machine.data.defaultUser || "your account"}</span>
           </span>
         ) : null}
       </div>

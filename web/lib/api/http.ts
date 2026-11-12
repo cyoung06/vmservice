@@ -30,7 +30,7 @@ const refusalMessage = async (response: Response): Promise<string> => {
   return plain.slice(0, 300) || `${response.status} ${response.statusText}`;
 };
 
-export type Method = "GET" | "POST" | "DELETE";
+export type Method = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export const request = async <Result>(method: Method, path: string, json?: unknown): Promise<Result> => {
   const headers: Record<string, string> = {
@@ -60,6 +60,8 @@ export const request = async <Result>(method: Method, path: string, json?: unkno
 export const get = <Result>(path: string): Promise<Result> => request<Result>("GET", path);
 export const post = <Result>(path: string, json?: unknown): Promise<Result> => request<Result>("POST", path, json);
 export const remove = <Result>(path: string): Promise<Result> => request<Result>("DELETE", path);
+export const put = <Result>(path: string, json?: unknown): Promise<Result> => request<Result>("PUT", path, json);
+export const patch = <Result>(path: string, json?: unknown): Promise<Result> => request<Result>("PATCH", path, json);
 
 /** The websocket URL of a path on this origin. */
 export const socketUrl = (path: string): string =>

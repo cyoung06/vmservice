@@ -2,35 +2,43 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 
+import { useSession } from "@/components/session/session-context";
 import { ApiError, get, signedOutEvent } from "@/lib/api/http";
-import { loadMedia } from "@/lib/api/media";
-import type { Machine, Medium } from "@/lib/api/types";
+import { loadImages } from "@/lib/api/images";
+import type { Machine, VmImage } from "@/lib/api/types";
 import { messageOf } from "@/lib/errors";
 
 /**
- * The caller's machines, live: one EventSource on /api/vms/events for the whole app. The stream
- * starts with a snapshot and then sends each change; there is no polling. EventSource reconnects
- * by itself after a dropped connection. When the server refuses a reconnect (it closes the stream
- * when the session expires), the session is asked once: a 401 signs the user out, anything else
- * leaves a "stopped" notice with a button to reconnect.
+ * Machines and images, live: one EventSource on /api/vms/events for the whole app. The stream
+ * starts with a snapshot of the caller's machines and then sends each change; there is no polling.
+ * EventSource reconnects by itself after a dropped connection. When the server refuses a reconnect
+ * (it closes the stream when the session expires), the session is asked once: a 401 signs the user
+ * out, anything else leaves a "stopped" notice with a button to reconnect.
  *
- * Media (ISOs and disk images) ride the same stream: the list is fetched once each time the stream
- * (re)starts, then kept current by its "medium" and "medium-deleted" events.
+ * Admins also get other members' machines' events (those carry "owner"): they're kept apart, in
+ * `allMachines`, so the member's own list and usage stay theirs.
+ *
+ * Images ride the same stream: the list is fetched once each time the stream (re)starts, then kept
+ * current by its "image" and "image-deleted" events.
  */
 type MachinesValue = {
-  /** null until the first snapshot. Newest first. */
+  /** The caller's own machines; null until the first snapshot. Newest first. */
   readonly machines: readonly Machine[] | null;
+  /** Every machine seen: the caller's plus, for admins, other members'. Newest first. */
+  readonly allMachines: readonly Machine[];
   /** Live updates stopped and why; null while they run. */
   readonly stopped: string | null;
   readonly reconnect: () => void;
   /** Puts a machine the API just returned into the list, unless the event stream already has it (its state is newer). */
   readonly put: (machine: Machine) => void;
-  /** The caller's and the shared media, newest first; null until loaded. */
-  readonly media: readonly Medium[] | null;
-  /** Why the media list couldn't be loaded, if it couldn't. */
-  readonly mediaError: string | null;
-  /** Puts a medium the API just returned into the list, unless the stream already has it. */
-  readonly putMedium: (medium: Medium) => void;
+  /** Puts many (an admin's list of every machine), keeping what the stream already has. */
+  readonly putAll: (machines: readonly Machine[]) => void;
+  /** The caller's and the public images (admins: all), newest first; null until loaded. */
+  readonly images: readonly VmImage[] | null;
+  /** Why the image list couldn't be loaded, if it couldn't. */
+  readonly imagesError: string | null;
+  /** Puts an image the API just returned into the list (replacing what's there: it's newer). */
+  readonly putImage: (image: VmImage) => void;
 };
 
 const MachinesContext = createContext<MachinesValue | null>(null);
@@ -39,41 +47,54 @@ const newestFirst = <Item extends { readonly createdAt: string }>(items: Iterabl
   [...items].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
 export const MachinesProvider = ({ children }: { readonly children: ReactNode }) => {
+  const { user } = useSession();
   const [byId, setById] = useState<ReadonlyMap<string, Machine> | null>(null);
   const [stopped, setStopped] = useState<string | null>(null);
   const [generation, setGeneration] = useState(0);
-  const [mediaById, setMediaById] = useState<ReadonlyMap<string, Medium> | null>(null);
-  const [mediaError, setMediaError] = useState<string | null>(null);
+  const [imagesById, setImagesById] = useState<ReadonlyMap<string, VmImage> | null>(null);
+  const [imagesError, setImagesError] = useState<string | null>(null);
 
   useEffect(() => {
     const source = new EventSource("/api/vms/events");
     let closed = false;
     source.addEventListener("snapshot", (event) => {
       const { vms } = JSON.parse((event as MessageEvent<string>).data) as { vms: Machine[] };
-      setById(new Map(vms.map((vm) => [vm.id, vm])));
+      setById((previous) => {
+        // Keep other members' machines an admin loaded; the snapshot is the caller's own.
+        const next = new Map<string, Machine>();
+        for (const machine of previous?.values() ?? []) {
+          if (machine.owner && machine.owner !== user.username) {
+            next.set(machine.id, machine);
+          }
+        }
+        for (const vm of vms) {
+          next.set(vm.id, vm);
+        }
+        return next;
+      });
       setStopped(null);
-      // The stream is live now, so no medium change is missed after this read.
-      void loadMedia().then(
-        (media) => {
+      // The stream is live now, so no image change is missed after this read.
+      void loadImages().then(
+        (images) => {
           if (!closed) {
-            setMediaById(new Map(media.map((medium) => [medium.id, medium])));
-            setMediaError(null);
+            setImagesById(new Map(images.map((image) => [image.id, image])));
+            setImagesError(null);
           }
         },
         (error: unknown) => {
           if (!closed) {
-            setMediaError(messageOf(error));
+            setImagesError(messageOf(error));
           }
         },
       );
     });
-    source.addEventListener("medium", (event) => {
-      const medium = JSON.parse((event as MessageEvent<string>).data) as Medium;
-      setMediaById((previous) => new Map(previous ?? []).set(medium.id, medium));
+    source.addEventListener("image", (event) => {
+      const image = JSON.parse((event as MessageEvent<string>).data) as VmImage;
+      setImagesById((previous) => new Map(previous ?? []).set(image.id, image));
     });
-    source.addEventListener("medium-deleted", (event) => {
+    source.addEventListener("image-deleted", (event) => {
       const { id } = JSON.parse((event as MessageEvent<string>).data) as { id: string };
-      setMediaById((previous) => {
+      setImagesById((previous) => {
         const next = new Map(previous ?? []);
         next.delete(id);
         return next;
@@ -114,7 +135,7 @@ export const MachinesProvider = ({ children }: { readonly children: ReactNode })
       window.removeEventListener(signedOutEvent, close);
       close();
     };
-  }, [generation]);
+  }, [generation, user.username]);
 
   const reconnect = useCallback(() => {
     setStopped(null);
@@ -125,22 +146,36 @@ export const MachinesProvider = ({ children }: { readonly children: ReactNode })
     setById((previous) => (previous?.has(machine.id) ? previous : new Map(previous ?? []).set(machine.id, machine)));
   }, []);
 
-  const putMedium = useCallback((medium: Medium) => {
-    setMediaById((previous) => (previous?.has(medium.id) ? previous : new Map(previous ?? []).set(medium.id, medium)));
+  const putAll = useCallback((machines: readonly Machine[]) => {
+    setById((previous) => {
+      const next = new Map(previous ?? []);
+      for (const machine of machines) {
+        if (!next.has(machine.id)) {
+          next.set(machine.id, machine);
+        }
+      }
+      return next;
+    });
   }, []);
 
-  const value = useMemo(
-    (): MachinesValue => ({
-      machines: byId ? newestFirst(byId.values()) : null,
+  const putImage = useCallback((image: VmImage) => {
+    setImagesById((previous) => new Map(previous ?? []).set(image.id, image));
+  }, []);
+
+  const value = useMemo((): MachinesValue => {
+    const all = byId ? newestFirst(byId.values()) : [];
+    return {
+      machines: byId ? all.filter((machine) => !machine.owner || machine.owner === user.username) : null,
+      allMachines: all,
       stopped,
       reconnect,
       put,
-      media: mediaById ? newestFirst(mediaById.values()) : null,
-      mediaError,
-      putMedium,
-    }),
-    [byId, stopped, reconnect, put, mediaById, mediaError, putMedium],
-  );
+      putAll,
+      images: imagesById ? newestFirst(imagesById.values()) : null,
+      imagesError,
+      putImage,
+    };
+  }, [byId, user.username, stopped, reconnect, put, putAll, imagesById, imagesError, putImage]);
   return <MachinesContext.Provider value={value}>{children}</MachinesContext.Provider>;
 };
 

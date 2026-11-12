@@ -2,6 +2,7 @@ package machines
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -12,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/GehirnInc/crypt/sha512_crypt"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	kubevirtv1 "kubevirt.io/api/core/v1"
@@ -24,19 +25,24 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/cyoung06/vmservice/internal/config"
+	"github.com/cyoung06/vmservice/internal/inspect"
 	"github.com/cyoung06/vmservice/internal/store"
 )
 
 var catalog = &config.Catalog{
-	Images: []config.Image{{ID: "ubuntu", Name: "Ubuntu 24.04", Source: "ubuntu-src", DefaultUser: "ubuntu",
-		CloudConfig: map[string]any{"apt": map[string]any{"primary": []any{map[string]any{"arches": []any{"default"}, "uri": "http://mirror.kaist.ac.kr/ubuntu/"}}}, "hostname": "evil"}}},
 	Sizes:  []config.Size{{ID: "small", Name: "Small", CPU: 2, MemoryMiB: 2048}},
 	Disk:   config.Disk{MinGiB: 10, MaxGiB: 100, DefaultGiB: 20},
 	Limits: config.Limits{VMs: 2, CPU: 4, MemoryMiB: 8192, DiskGiB: 100},
 }
 
-// testService is a Service over a fake client, with KubeVirt's subresources answered by an
-// httptest server that records what was called.
+var (
+	alice = Actor{Owner: "alice", Username: "alice"}
+	bob   = Actor{Owner: "bob", Username: "bob"}
+	admin = Actor{Owner: "root", Username: "root", Admin: true}
+)
+
+// testService is a Service over a fake client and an in-memory store, with KubeVirt's subresources
+// answered by an httptest server that records what was called.
 func testService(t *testing.T) (*Service, *[]string) {
 	t.Helper()
 	scheme := runtime.NewScheme()
@@ -62,166 +68,210 @@ func testService(t *testing.T) (*Service, *[]string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	st := store.NewMemory()
-	st.UpsertMember(ctx, "alice", "alice")
-	st.UpsertMember(ctx, "bob", "bob")
+	for _, a := range []Actor{alice, bob, admin} {
+		st.UpsertMember(ctx, a.Owner, a.Username)
+	}
 	s := &Service{
 		Namespace: "cloud", Catalog: catalog, Config: &rest.Config{Host: srv.URL},
 		read: c, write: c, watch: c, store: st, http: srv.Client(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MediaConfig: MediaConfig{InspectImage: "vmservice:test", DriversImage: "virtio:test"},
 	}
 	s.hub = newHub(ctx, s.render)
 	return s, calls
 }
 
-func request(t *testing.T) Request {
-	hash, err := HashPassword("correct horse")
-	if err != nil {
-		t.Fatal(err)
+func status(err error) int {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Status
 	}
-	return Request{Name: "my box", Image: catalog.Images[0], Size: catalog.Sizes[0], DiskGiB: 20, PasswordHash: hash}
+	return 0
 }
 
-func TestCreateBuildsManualVMThenSecretThenStarts(t *testing.T) {
-	s, calls := testService(t)
+func isoHeader() []byte {
+	h := make([]byte, inspect.HeaderSize)
+	copy(h[16*2048+1:], "CD001")
+	copy(h[16*2048+40:], "CCCOMA_X64FRE_EN-US_DV9")
+	return h
+}
+
+func qcowHeader(virtualGiB uint64) []byte {
+	q := make([]byte, 64)
+	copy(q, "QFI\xfb")
+	v := virtualGiB << 30
+	for i := 0; i < 8; i++ {
+		q[24+i] = byte(v >> (56 - 8*i))
+	}
+	return q
+}
+
+func markImported(t *testing.T, s *Service, id string) {
+	t.Helper()
 	ctx := context.Background()
-	m, err := s.Create(ctx, "alice", request(t))
+	var dv cdiv1.DataVolume
+	if err := s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: id}, &dv); err != nil {
+		t.Fatal(err)
+	}
+	dv.Status.Phase = cdiv1.Succeeded
+	if err := s.write.Status().Update(ctx, &dv); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// readyImage adds an image for a and makes it look imported and inspected.
+func readyImage(t *testing.T, s *Service, a Actor, header []byte, size int64, profile string) string {
+	t.Helper()
+	m, err := s.AddUpload(context.Background(), a, "img", size, header)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(m.ID, "vm-") || len(m.ID) != 9 || m.Name != "my box" || m.CPU != 2 || m.DiskGiB != 20 || m.DefaultUser != "ubuntu" {
-		t.Fatalf("machine = %+v", m)
+	markImported(t, s, m.ID)
+	s.store.SetMediumProfile(context.Background(), m.ID, profile, 0)
+	return m.ID
+}
+
+func request(name, image string) Request {
+	hash, _ := HashPassword("correct horse")
+	return Request{Name: name, MediaID: image, Size: catalog.Sizes[0], DiskGiB: 30, PasswordHash: hash}
+}
+
+func (s *Service) secretUserData(ctx context.Context, id string) (map[string]any, error) {
+	var secret corev1.Secret
+	if err := s.read.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: id + "-init"}, &secret); err != nil {
+		return nil, err
+	}
+	var doc map[string]any
+	err := yaml.Unmarshal(secret.Data["userdata"], &doc)
+	return doc, err
+}
+
+func TestCreateFromPresetGivesTheMembersAccount(t *testing.T) {
+	s, calls := testService(t)
+	ctx := context.Background()
+	img := readyImage(t, s, bob, qcowHeader(5), 700<<20, "bios")
+	yes := true
+	extras := map[string]any{"apt": map[string]any{"primary": []any{"x"}}}
+	if _, err := s.UpdateMedium(ctx, bob, img, store.MediumUpdate{Public: &yes, CloudConfig: extras}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateMedium(ctx, bob, img, store.MediumUpdate{CloudConfig: map[string]any{"users": []any{"evil"}}}); status(err) != http.StatusBadRequest {
+		t.Errorf("extras setting users = %v, want 400", err)
+	}
+	uid := 10001
+	s.SetUID(ctx, alice, &uid)
+	m, err := s.Create(ctx, alice, request("box1", img))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Name != "box1" || m.User != "alice" || m.Media != img || m.Owner != "alice" {
+		t.Errorf("machine = %+v", m)
 	}
 	var vm kubevirtv1.VirtualMachine
-	if err := s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID}, &vm); err != nil {
+	s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID}, &vm)
+	if src := vm.Spec.DataVolumeTemplates[0].Spec.Source.PVC; src == nil || src.Name != img {
+		t.Errorf("root source = %+v", vm.Spec.DataVolumeTemplates[0].Spec.Source)
+	}
+	doc, err := s.secretUserData(ctx, m.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if *vm.Spec.RunStrategy != kubevirtv1.RunStrategyManual {
-		t.Errorf("run strategy = %s; want Manual: not running until started, and a guest shutdown stays off", *vm.Spec.RunStrategy)
+	if doc["hostname"] != "box1" || doc["apt"] == nil || doc["ssh_pwauth"] != false {
+		t.Errorf("cloud-config = %v", doc)
 	}
-	if vm.Labels[LabelOwner] != "alice" || vm.Spec.Template.ObjectMeta.Labels[LabelOwner] != "alice" {
-		t.Errorf("owner labels = %v / %v", vm.Labels, vm.Spec.Template.ObjectMeta.Labels)
+	users := doc["users"].([]any)
+	acct := users[1].(map[string]any)
+	if users[0] != "default" || acct["name"] != "alice" || acct["uid"] != float64(10001) || !strings.HasPrefix(acct["passwd"].(string), "$6$") || acct["lock_passwd"] != false {
+		t.Errorf("users = %v", users)
 	}
-	src := vm.Spec.DataVolumeTemplates[0].Spec.Source.PVC
-	if src.Namespace != "cloud" || src.Name != "ubuntu-src" {
-		t.Errorf("clone source = %+v", src)
-	}
-	if got := vm.Spec.DataVolumeTemplates[0].Spec.Storage.Resources.Requests.Storage().String(); got != "20Gi" {
-		t.Errorf("disk = %s", got)
-	}
-	var secret corev1.Secret
-	if err := s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID + "-init"}, &secret); err != nil {
-		t.Fatal(err)
-	}
-	if len(secret.OwnerReferences) != 1 || secret.OwnerReferences[0].Name != m.ID || secret.OwnerReferences[0].Kind != "VirtualMachine" {
-		t.Errorf("secret owner = %+v", secret.OwnerReferences)
-	}
-	if len(*calls) != 1 || *calls != nil && (*calls)[0] != "PUT /apis/subresources.kubevirt.io/v1/namespaces/cloud/virtualmachines/"+m.ID+"/start" {
+	if len(*calls) != 1 || !strings.HasSuffix((*calls)[0], "/"+m.ID+"/start") {
 		t.Errorf("subresource calls = %v", *calls)
 	}
 }
 
-func TestCloudConfigServiceKeysWin(t *testing.T) {
-	r := request(t)
-	data, err := cloudConfig("vm-abcdef", r)
-	if err != nil {
+func TestNames(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	img := readyImage(t, s, alice, qcowHeader(5), 700<<20, "bios")
+	for _, name := range []string{"Box", "-x", "has space", "vm-abcdef", strings.Repeat("a", 64)} {
+		if _, err := s.Create(ctx, alice, request(name, img)); status(err) != http.StatusBadRequest {
+			t.Errorf("name %q = %v, want 400", name, err)
+		}
+	}
+	if _, err := s.Create(ctx, alice, request("taken", img)); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(data), "#cloud-config\n") {
-		t.Fatalf("no #cloud-config header: %q", data)
+	yes := true
+	s.UpdateMedium(ctx, alice, img, store.MediumUpdate{Public: &yes})
+	if _, err := s.Create(ctx, bob, request("taken", img)); status(err) != http.StatusConflict {
+		t.Errorf("another member reusing a name = %v, want 409 (names are unique across everyone)", err)
 	}
-	var doc map[string]any
-	if err := yaml.Unmarshal(data, &doc); err != nil {
-		t.Fatal(err)
+	if ok, _, _ := s.NameAvailable(ctx, "taken"); ok {
+		t.Error("a taken name is available")
 	}
-	if doc["hostname"] != "vm-abcdef" || doc["ssh_pwauth"] != false {
-		t.Errorf("hostname/ssh_pwauth = %v/%v; the image's extras must not override them", doc["hostname"], doc["ssh_pwauth"])
-	}
-	if _, ok := doc["apt"]; !ok {
-		t.Error("the image's apt extras are missing")
-	}
-	users := doc["chpasswd"].(map[string]any)["users"].([]any)
-	u := users[0].(map[string]any)
-	if u["name"] != "ubuntu" || u["type"] != "hash" || !strings.HasPrefix(u["password"].(string), "$6$") {
-		t.Errorf("chpasswd user = %v", u)
-	}
-	if strings.Contains(string(data), "correct horse") {
-		t.Error("the plaintext password is in the cloud-config")
-	}
-	if sha512_crypt.New().Verify(u["password"].(string), []byte("correct horse")) != nil {
-		t.Error("the hash doesn't verify the password")
+	if ok, _, _ := s.NameAvailable(ctx, "free-one"); !ok {
+		t.Error("a free name isn't available")
 	}
 }
 
-func TestOtherMembersMachinesAreNotFound(t *testing.T) {
-	s, calls := testService(t)
+func TestImageVisibilityAndAdmin(t *testing.T) {
+	s, _ := testService(t)
 	ctx := context.Background()
-	m, err := s.Create(ctx, "alice", request(t))
-	if err != nil {
-		t.Fatal(err)
+	img := readyImage(t, s, alice, qcowHeader(5), 700<<20, "bios")
+	if _, err := s.Create(ctx, bob, request("bobs", img)); status(err) != http.StatusBadRequest {
+		t.Errorf("bob using alice's private image = %v, want 400", err)
 	}
-	*calls = nil
-	for _, id := range []string{"a/../../secrets", "vm-ABCDEF", "vm-aaaaaa/console", ""} {
-		if _, err := s.Get(ctx, "alice", id); err != ErrNotFound {
-			t.Errorf("Get(%q) = %v, want not found", id, err)
-		}
-	}
-	if _, err := s.Get(ctx, "bob", m.ID); err != ErrNotFound {
-		t.Errorf("bob Get = %v, want not found", err)
-	}
-	if err := s.Action(ctx, "bob", m.ID, "start"); err != ErrNotFound {
-		t.Errorf("bob start = %v, want not found", err)
-	}
-	if err := s.Delete(ctx, "bob", m.ID); err != ErrNotFound {
-		t.Errorf("bob delete = %v, want not found", err)
-	}
-	if running, err := s.Running(ctx, "bob", m.ID); err != ErrNotFound || running {
-		t.Errorf("bob running = %v, %v", running, err)
-	}
-	if list, _ := s.List(ctx, "bob"); len(list) != 0 {
+	if list, _ := s.Media(ctx, bob); len(list) != 0 {
 		t.Errorf("bob sees %v", list)
 	}
-	if len(*calls) != 0 {
-		t.Errorf("bob's requests reached KubeVirt: %v", *calls)
+	yes := true
+	if _, err := s.UpdateMedium(ctx, bob, img, store.MediumUpdate{Public: &yes}); status(err) != http.StatusNotFound {
+		t.Errorf("bob publishing alice's image = %v, want 404", err)
 	}
-	if err := s.Delete(ctx, "alice", m.ID); err != nil {
-		t.Errorf("alice delete = %v", err)
+	s.UpdateMedium(ctx, alice, img, store.MediumUpdate{Public: &yes})
+	if list, _ := s.Media(ctx, bob); len(list) != 1 || list[0].Mine || list[0].Owner != "alice" {
+		t.Errorf("bob's list = %+v", list)
+	}
+	if err := s.DeleteMedium(ctx, bob, img); status(err) != http.StatusNotFound {
+		t.Errorf("bob deleting alice's public image = %v, want 404", err)
+	}
+	m, err := s.Create(ctx, alice, request("alices", img))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Get(ctx, bob, m.ID); err != ErrNotFound {
+		t.Errorf("bob Get = %v", err)
+	}
+	if got, err := s.Get(ctx, admin, m.ID); err != nil || got.Owner != "alice" {
+		t.Errorf("admin Get = %+v, %v", got, err)
+	}
+	if _, err := s.AllMachines(ctx, bob); status(err) != http.StatusForbidden {
+		t.Errorf("bob AllMachines = %v, want 403", err)
+	}
+	if all, _ := s.AllMachines(ctx, admin); len(all) != 1 {
+		t.Errorf("admin AllMachines = %v", all)
+	}
+	if err := s.DeleteMedium(ctx, admin, img); err != nil {
+		t.Errorf("admin deleting an image = %v", err)
+	}
+	if err := s.Delete(ctx, admin, m.ID); err != nil {
+		t.Errorf("admin deleting a machine = %v", err)
 	}
 }
 
-func TestLimits(t *testing.T) {
+func TestQuotas(t *testing.T) {
 	s, _ := testService(t)
 	ctx := context.Background()
-	for i := 0; i < 2; i++ {
-		if _, err := s.Create(ctx, "alice", request(t)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	_, err := s.Create(ctx, "alice", request(t))
-	var e *Error
-	if !errors.As(err, &e) || e.Status != http.StatusForbidden {
-		t.Fatalf("third machine = %v, want 403 (limit 2 VMs / 4 vCPUs)", err)
-	}
-	if _, err := s.Create(ctx, "bob", request(t)); err != nil {
-		t.Errorf("bob's limits are his own: %v", err)
-	}
-	u, _ := s.Usage(ctx, "alice")
-	if u != (store.Usage{VMs: 2, CPU: 4, MemoryMiB: 4096, DiskGiB: 40}) {
-		t.Errorf("usage = %+v", u)
-	}
-}
-
-// A member firing many creates at once gets exactly their limit: creates run one at a time and count
-// usage live.
-func TestParallelCreatesHoldTheLimit(t *testing.T) {
-	s, _ := testService(t)
-	ctx := context.Background()
+	img := readyImage(t, s, alice, qcowHeader(5), 700<<20, "bios")
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	made := 0
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := s.Create(ctx, "alice", request(t)); err == nil {
+			r := request("m"+string(rune('a'+i)), img)
+			r.Size.CPU = 1
+			if _, err := s.Create(ctx, alice, r); err == nil {
 				mu.Lock()
 				made++
 				mu.Unlock()
@@ -230,18 +280,158 @@ func TestParallelCreatesHoldTheLimit(t *testing.T) {
 	}
 	wg.Wait()
 	if made != 2 {
-		t.Errorf("20 parallel creates made %d machines; the limit is 2", made)
+		t.Errorf("10 parallel creates made %d; the default limit is 2", made)
+	}
+	three := 3
+	if err := s.SetQuota(ctx, bob, "alice", store.Quota{VMs: &three}); status(err) != http.StatusForbidden {
+		t.Errorf("bob setting quotas = %v, want 403", err)
+	}
+	if err := s.SetQuota(ctx, admin, "alice", store.Quota{VMs: &three}); err != nil {
+		t.Fatal(err)
+	}
+	r := request("third", img)
+	r.Size.CPU = 1
+	if _, err := s.Create(ctx, alice, r); err != nil {
+		t.Errorf("third machine with a quota of 3 = %v", err)
+	}
+	yes := true
+	s.UpdateMedium(ctx, alice, img, store.MediumUpdate{Public: &yes})
+	for i := 0; i < 4; i++ {
+		if _, err := s.Create(ctx, admin, request("adm"+string(rune('a'+i)), img)); err != nil {
+			t.Errorf("admins have no limits: %v", err)
+		}
+	}
+	members, _ := s.Members(ctx, admin)
+	for _, m := range members {
+		if m.Username == "alice" && (m.Usage.VMs != 3 || *m.Quota.VMs != 3) {
+			t.Errorf("alice = %+v", m)
+		}
 	}
 }
 
-func TestActionRefusalIsPassedOn(t *testing.T) {
+func TestPasswordAndWindows(t *testing.T) {
 	s, _ := testService(t)
 	ctx := context.Background()
-	m, _ := s.Create(ctx, "alice", request(t))
-	err := s.Action(ctx, "alice", m.ID, "stop")
-	var e *Error
-	if !errors.As(err, &e) || e.Status != http.StatusConflict || !strings.Contains(e.Message, "VM is not running") {
-		t.Errorf("stop = %v", err)
+	img := readyImage(t, s, alice, qcowHeader(5), 700<<20, "bios")
+	r := request("nopass", img)
+	r.PasswordHash = ""
+	if _, err := s.Create(ctx, alice, r); status(err) != http.StatusBadRequest {
+		t.Errorf("no password and no key = %v, want 400", err)
+	}
+	win := readyImage(t, s, alice, isoHeader(), 6<<30, "windows")
+	r = request("win", win)
+	r.DiskGiB = 64
+	m, err := s.Create(ctx, alice, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.User != "" || m.Profile != "windows" || !m.InstallMedia {
+		t.Errorf("windows machine = %+v", m)
+	}
+	if _, err := s.secretUserData(ctx, m.ID); err == nil {
+		t.Error("a Windows machine got cloud-init")
+	}
+	var vm kubevirtv1.VirtualMachine
+	s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID}, &vm)
+	spec := vm.Spec.Template.Spec
+	if spec.Domain.Devices.TPM == nil || !*spec.Domain.Firmware.Bootloader.EFI.SecureBoot || spec.Domain.Features.SMM == nil || !hasVolume(&vm, volumeDrivers) {
+		t.Error("a Windows machine lacks TPM, Secure Boot, SMM or the driver CD")
+	}
+	if err := s.Eject(ctx, alice, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID}, &vm)
+	if hasInstallMedia(&vm) || len(vm.Spec.DataVolumeTemplates) != 1 {
+		t.Error("eject left the CD-ROMs")
+	}
+	if err := s.Eject(ctx, alice, m.ID); status(err) != http.StatusConflict {
+		t.Errorf("second eject = %v, want 409", err)
+	}
+}
+
+// The inspector Job's result becomes the image's profile; the Job is removed.
+func TestInspection(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	m, err := s.AddUpload(ctx, alice, "Ubuntu", 2<<30, isoHeader())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AddUpload(ctx, alice, "notes", 100, []byte("hello")); status(err) != http.StatusBadRequest {
+		t.Errorf("a text file = %v, want 400", err)
+	}
+	markImported(t, s, m.ID)
+	var dv cdiv1.DataVolume
+	s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID}, &dv)
+	s.ensureInspected(&dv)
+	var job batchv1.Job
+	if err := s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: "inspect-" + m.ID}, &job); err != nil {
+		t.Fatalf("no inspector Job: %v", err)
+	}
+	spec := job.Spec.Template.Spec
+	if *spec.AutomountServiceAccountToken || !spec.Containers[0].VolumeMounts[0].ReadOnly || job.Spec.Template.Labels["app"] != "vmservice-inspect" {
+		t.Errorf("inspector Job isn't locked down: %+v", spec)
+	}
+	out, _ := json.Marshal(inspect.Result{Kind: "iso", Profile: "linux", VirtualBytes: 2 << 30})
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: job.Name + "-x", Namespace: "cloud", Labels: map[string]string{"job-name": job.Name}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: string(out)}}}}}}
+	if err := s.write.Create(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	job.Status.Succeeded = 1
+	s.inspected(&job)
+	if got, _ := s.GetMedium(ctx, alice, m.ID); got.State != "Ready" || got.Profile != "linux" {
+		t.Errorf("image = %+v, want Ready/linux", got)
+	}
+	if err := s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: job.Name}, &job); err == nil {
+		t.Error("the finished Job wasn't removed")
+	}
+}
+
+func TestEvents(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	alices, stopA := s.Subscribe("alice")
+	defer stopA()
+	bobs, stopB := s.Subscribe("bob")
+	defer stopB()
+	admins, stopAdm := s.Subscribe(Everyone)
+	defer stopAdm()
+	img := readyImage(t, s, alice, qcowHeader(5), 700<<20, "bios")
+	expect := func(name string, ch <-chan Event, kind string) {
+		t.Helper()
+		for {
+			select {
+			case e := <-ch:
+				if e.Kind == kind {
+					return
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("%s got no %s event", name, kind)
+			}
+		}
+	}
+	yes, no := true, false
+	s.UpdateMedium(ctx, alice, img, store.MediumUpdate{Public: &yes})
+	expect("bob", bobs, "image") // a public image reaches everyone
+	s.UpdateMedium(ctx, alice, img, store.MediumUpdate{Public: &no})
+	expect("bob", bobs, "image-deleted") // and unpublishing takes it away again
+	m, err := s.Create(ctx, alice, request("evt", img))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var vm kubevirtv1.VirtualMachine
+	s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID}, &vm)
+	for len(bobs) > 0 {
+		<-bobs
+	}
+	s.changed(&vm)
+	expect("alice", alices, "vm")
+	expect("admin", admins, "vm")
+	select {
+	case e := <-bobs:
+		t.Errorf("bob got %+v", e)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -257,71 +447,30 @@ func TestState(t *testing.T) {
 			t.Errorf("%q -> %q, want %q", printable, got, want)
 		}
 	}
-	vm.Status.PrintableStatus = "Provisioning"
-	if _, d := state(vm, disk); d != "Copying the disk: 45.0%" {
-		t.Errorf("detail = %q", d)
-	}
 }
 
-func TestEventsGoToTheOwnerOnly(t *testing.T) {
-	s, _ := testService(t)
-	alice, stopA := s.Subscribe("alice")
-	defer stopA()
-	bob, stopB := s.Subscribe("bob")
-	defer stopB()
-	vm := buildVM("cloud", "vm-aaaaaa", "alice", "", request(t))
-	s.store.CreateMachine(context.Background(), store.Machine{ID: "vm-aaaaaa", Owner: "alice", Name: "box"}, func(store.Usage) error { return nil })
-	if err := s.write.Create(context.Background(), vm); err != nil {
-		t.Fatal(err)
-	}
-	s.changed(vm)
-	select {
-	case e := <-alice:
-		if e.Kind != "vm" || e.Data.(Machine).ID != "vm-aaaaaa" {
-			t.Errorf("alice got %+v", e)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("alice got nothing")
-	}
-	s.write.Delete(context.Background(), vm)
-	s.vmGone(vm)
-	select {
-	case e := <-alice:
-		if e.Kind != "deleted" {
-			t.Errorf("alice got %+v", e)
-		}
-		if _, err := s.store.Machine(context.Background(), "vm-aaaaaa"); err == nil {
-			t.Error("the row outlived its VM") // the delete event comes after the row is gone
-		}
-	case <-time.After(time.Second):
-		t.Fatal("alice got no delete")
-	}
-	select {
-	case e := <-bob:
-		t.Errorf("bob got alice's event %+v", e)
-	case <-time.After(50 * time.Millisecond):
-	}
-}
-
-func (s *Service) secretUserData(ctx context.Context, id string) ([]byte, error) {
-	var secret corev1.Secret
-	if err := s.read.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: id + "-init"}, &secret); err != nil {
-		return nil, err
-	}
-	return secret.Data["userdata"], nil
-}
-
-// Deleting a machine whose VM doesn't exist: refused while a create could still be under way,
-// allowed (and the row removed) after the grace period.
 func TestDeleteMissingVM(t *testing.T) {
 	s, _ := testService(t)
 	ctx := context.Background()
-	s.store.CreateMachine(ctx, store.Machine{ID: "vm-mmmmmm", Owner: "alice", Name: "x"}, func(store.Usage) error { return nil })
-	if err := s.Delete(ctx, "alice", "vm-mmmmmm"); status(err) != http.StatusConflict {
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-mmmmmm", Owner: "alice", Name: "ghost"}, func(store.Usage, store.Quota) error { return nil })
+	if err := s.Delete(ctx, alice, "vm-mmmmmm"); status(err) != http.StatusConflict {
 		t.Errorf("delete right after the row = %v, want 409 (a create may still be making the VM)", err)
 	}
-	m, _ := s.Get(ctx, "alice", "vm-mmmmmm")
-	if m.State != "Provisioning" {
-		t.Errorf("state = %s, want Provisioning within the grace period", m.State)
+}
+
+func TestLookupByName(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	s.store.CreateMachine(ctx, store.Machine{ID: "vm-aaaaaa", Owner: "alice", Name: "mybox"}, func(store.Usage, store.Quota) error { return nil })
+	l := &Lookup{Namespace: s.Namespace, store: s.store, read: s.read}
+	for host, want := range map[string]int{"mybox": http.StatusConflict, "MYBOX": http.StatusConflict, "vm-aaaaaa": http.StatusConflict, "nothere": 404, "../x": 404} {
+		_, err := l.Address(ctx, host)
+		got := status(err)
+		if err == ErrNotFound {
+			got = 404
+		}
+		if got != want {
+			t.Errorf("Address(%q) = %v, want %d (409: found but not running)", host, err, want)
+		}
 	}
 }

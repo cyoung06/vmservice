@@ -36,8 +36,9 @@ It is a Next.js static export served by a small Go binary, on its own origin.
 - **Limits** are per member (machines, vCPUs, memory, disk) and checked in one SERIALIZABLE
   transaction with the insert, so they hold however many requests arrive at once.
 - **Open streams** (live views and consoles) are capped per member (`-max-streams`).
-- **Media**: members upload ISOs and disk images (qcow2, VMDK, raw) or have CDI download them from a
-  URL; admins can list shared ones in the catalog. What a file is (ISO or disk image, and a device
+- **Images**: members upload ISOs and disk images (qcow2, VMDK, raw) or have CDI download them from a
+  URL, and can make them public; a public image with cloud-config extras (mirrors, packages) is a
+  preset. What a file is (ISO or disk image, and a device
   profile: `windows`, `linux`, `uefi`, `bios`) comes from its header and from an inspector Job
   (`vmservice inspect`: the disk mounted read-only, no network; a URL is first probed by a Job that may
   only reach the internet). A disk image is cloned into a machine's root disk; an ISO is attached as a
@@ -45,12 +46,16 @@ It is a Next.js static export served by a small Go binary, on its own origin.
   and Hyper-V settings for Windows. Eject removes the CD-ROMs.
 - **SSH keys** are registered in the portal (one member per key) and go into each machine created
   afterwards (cloud-init `ssh_authorized_keys`).
-- **The SSH bastion** is a separate process, `vmservice bastion`, so the public SSH port sits behind
-  its own boundary: `ssh -J host:port user@vm-xxxxxx`. The key says who you are; the only thing
-  allowed is forwarding to port 22 of a running machine of yours, for as long as a sign-in lasts
-  after your last one. It can change nothing: its database role only reads members, machines and
-  keys (the portal grants that at start, `-bastion-db-role`), and its service account only reads
-  VirtualMachineInstances.
+- **Machine names are hostnames**, unique across everyone, and the machines' hostnames.
+- **Your account on machines**: every machine made from a disk image (or a Linux ISO) gets an account
+  named after your username, with your SSH keys, your password if you set one, passwordless sudo and
+  your chosen UID (cloud-init `users:`), next to the image's own default user.
+- **The SSH bastion** is a separate process, `vmservice bastion`, open to anyone like a public SSH
+  port: `ssh -J host:port <you>@<machine name>`. It forwards only to port 22 of running machines; the
+  machine's own sshd signs people in. It can change nothing: its database role only reads (the portal
+  grants that at start, `-bastion-db-role`), and its service account only reads VirtualMachineInstances.
+- **Admins** (`-admin-group`) see and manage every member's machines and images, set per-member
+  quotas, make images public, and have no limits.
 - **Live state** comes from an informer on the namespace's VMs and DataVolumes, and reaches the
   browser as server-sent events (`/api/vms/events`). There is no polling.
 - **Consoles**: the browser's websocket is passed through to KubeVirt's VMI `console` and `vnc`
@@ -74,7 +79,7 @@ vmservice -namespace vms -catalog /etc/vmservice/catalog.yaml -origin https://vm
 | --- | --- | --- |
 | `-listen` | `:8080` | plain HTTP; TLS terminates in front |
 | `-namespace` | (required) | the machines' and images' namespace |
-| `-catalog` | (required) | images, sizes, disk range, limits ([example](deploy/catalog.example.yaml)) |
+| `-catalog` | (required) | sizes, disk range, default limits ([example](deploy/catalog.example.yaml)) |
 | `-origin` | (required) | the public origin; the redirect URI is `<origin>/auth/callback` |
 | `-oidc-issuer` | (required) | the OpenID Connect issuer |
 | `-oidc-client-id` | (required) | |
@@ -93,11 +98,11 @@ vmservice -namespace vms -catalog /etc/vmservice/catalog.yaml -origin https://vm
 | `-cdi-upload-ca` | `cdi/cdi-uploadproxy-signer-bundle` | the ConfigMap with its CA |
 | `-virtio-drivers-image` | `quay.io/kubevirt/virtio-container-disk:v1.9.1` | the driver CD for Windows installs |
 | `-icons` | | a directory with `favicon.svg`, `favicon.ico`, `apple-touch-icon.png` (any may be missing) |
+| `-admin-group` | | the OIDC group whose members are admins |
 | `-bastion-db-role` | | the bastion's database role, granted read on members, machines and ssh_keys at every start |
 
 `vmservice bastion` takes `-namespace`, `-database-url-file` (its read-only role), `-listen`
-(`:2222`), `-host-key-file` (an OpenSSH private key), `-session-lifetime` (the portal's) and
-`-max-sessions` (`8` per member).
+(`:2222`), `-host-key-file` (an OpenSSH private key) and `-max-sessions` (`8` per source address).
 | `-title` | `VMService` | sidebar and tab title |
 | `-login-provider` | | name on the button ("Sign in with …") |
 

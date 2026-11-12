@@ -1,19 +1,6 @@
-# The -catalog file. Images are PVCs in the machines' namespace (imported once, e.g. with a CDI
-# DataVolume); each new machine's root disk is a clone of one.
-images:
-  - id: ubuntu-24.04
-    name: Ubuntu 24.04
-    source: ubuntu-24.04
-    defaultUser: ubuntu
-    cloudConfig:                     # merged into each machine's #cloud-config
-      apt:
-        primary:
-          - arches: [default]
-            uri: http://mirror.example.org/ubuntu/
-  - id: debian-13
-    name: Debian 13
-    source: debian-13
-    defaultUser: debian
+# The -catalog file: sizes members can pick, the disk range and the default per-member limits
+# (admins can set per-member quotas). Images are added in the portal (upload or URL; public ones
+# with cloud-config extras are presets).
 sizes:
   - {id: small, name: Small, cpu: 1, memoryMiB: 2048}
   - {id: medium, name: Medium, cpu: 2, memoryMiB: 4096}
