@@ -1,0 +1,23 @@
+# The -catalog file. Images are PVCs in the machines' namespace (imported once, e.g. with a CDI
+# DataVolume); each new machine's root disk is a clone of one.
+images:
+  - id: ubuntu-24.04
+    name: Ubuntu 24.04
+    source: ubuntu-24.04
+    defaultUser: ubuntu
+    cloudConfig:                     # merged into each machine's #cloud-config
+      apt:
+        primary:
+          - arches: [default]
+            uri: http://mirror.example.org/ubuntu/
+  - id: debian-13
+    name: Debian 13
+    source: debian-13
+    defaultUser: debian
+sizes:
+  - {id: small, name: Small, cpu: 1, memoryMiB: 2048}
+  - {id: medium, name: Medium, cpu: 2, memoryMiB: 4096}
+  - {id: large, name: Large, cpu: 4, memoryMiB: 8192}
+disk: {minGiB: 10, maxGiB: 100, defaultGiB: 20}
+limits: {vms: 3, cpu: 8, memoryMiB: 16384, diskGiB: 200}
+# storageClass: vm                   # the machines' disks; empty: the cluster's default

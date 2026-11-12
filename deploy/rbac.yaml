@@ -1,0 +1,46 @@
+# What vmservice's service account may do: the machines' namespace only, and nothing there but what
+# it needs. Replace "vms" with your namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vmservice
+  namespace: vms
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vmservice
+  namespace: vms
+rules:
+  - apiGroups: [kubevirt.io]
+    resources: [virtualmachines]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [subresources.kubevirt.io]
+    resources: [virtualmachines/start, virtualmachines/stop, virtualmachines/restart]
+    verbs: [update]
+  - apiGroups: [subresources.kubevirt.io]
+    resources: [virtualmachineinstances/console, virtualmachineinstances/vnc]
+    verbs: [get]
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datavolumes]
+    verbs: [get, list, watch]        # clone progress; each VM creates its own disk
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datavolumes/source]
+    verbs: [create]                  # CDI's check for cloning the images
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]                  # cloud-init only: no get or list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vmservice
+  namespace: vms
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: vmservice
+subjects:
+  - kind: ServiceAccount
+    name: vmservice
+    namespace: vms

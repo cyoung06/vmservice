@@ -1,0 +1,326 @@
+// Package api is the HTTP API under /api/ (docs/api.md): the signed-in member's machines.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+	"unicode/utf8"
+
+	"github.com/cyoung06/vmservice/internal/auth"
+	"github.com/cyoung06/vmservice/internal/console"
+	"github.com/cyoung06/vmservice/internal/machines"
+)
+
+// API serves /api/.
+type API struct {
+	auth     *auth.Auth
+	machines *machines.Service
+	console  *console.Proxy
+	origin   string
+	streams  *streams
+	log      *slog.Logger
+}
+
+// New is the API for origin (the public origin, no trailing slash; writes and consoles from another
+// Origin are refused). maxStreams caps each member's open event streams and consoles together.
+func New(a *auth.Auth, m *machines.Service, c *console.Proxy, origin string, maxStreams int, log *slog.Logger) *API {
+	return &API{auth: a, machines: m, console: c, origin: origin, streams: &streams{max: int64(maxStreams)}, log: log}
+}
+
+// streams counts each member's open long-lived connections (event streams and consoles).
+type streams struct {
+	max  int64
+	open sync.Map // owner -> *atomic.Int64
+}
+
+// take reserves one of owner's streams; release gives it back. false: the member is at the cap.
+func (s *streams) take(owner string) (release func(), ok bool) {
+	v, _ := s.open.LoadOrStore(owner, new(atomic.Int64))
+	n := v.(*atomic.Int64)
+	if n.Add(1) > s.max {
+		n.Add(-1)
+		return nil, false
+	}
+	return func() { n.Add(-1) }, true
+}
+
+func (a *API) tooMany(w http.ResponseWriter) {
+	reply(w, http.StatusTooManyRequests, detail(fmt.Sprintf("You have %d consoles and live views open; close some first.", a.streams.max)))
+}
+
+// Routes adds the API's endpoints to mux.
+func (a *API) Routes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /api/session", a.read(a.session))
+	mux.HandleFunc("GET /api/catalog", a.read(a.catalog))
+	mux.HandleFunc("GET /api/vms", a.read(a.list))
+	mux.HandleFunc("GET /api/vms/events", a.events)
+	mux.HandleFunc("GET /api/vms/{id}", a.read(a.get))
+	mux.HandleFunc("POST /api/vms", a.write(a.create))
+	mux.HandleFunc("POST /api/vms/{id}/{action}", a.write(a.action))
+	mux.HandleFunc("DELETE /api/vms/{id}", a.write(a.remove))
+	mux.HandleFunc("GET /api/vms/{id}/serial", a.consoleOf("console"))
+	mux.HandleFunc("GET /api/vms/{id}/vnc", a.consoleOf("vnc"))
+	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, http.StatusNotFound, detail("No such endpoint."))
+	})
+}
+
+type handler func(r *http.Request, s auth.Session) (status int, body any, err error)
+
+func detail(message string) map[string]string { return map[string]string{"detail": message} }
+
+func reply(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	if body != nil {
+		json.NewEncoder(w).Encode(body)
+	}
+}
+
+func (a *API) fail(w http.ResponseWriter, err error) {
+	var e *machines.Error
+	if errors.As(err, &e) {
+		reply(w, e.Status, detail(e.Message))
+		return
+	}
+	a.log.Error("api", "err", err)
+	reply(w, http.StatusInternalServerError, detail("Something went wrong on the server."))
+}
+
+func (a *API) serve(w http.ResponseWriter, r *http.Request, h handler) {
+	s, ok := a.auth.Session(r)
+	if !ok {
+		reply(w, http.StatusUnauthorized, detail("Sign in first."))
+		return
+	}
+	status, body, err := h(r, s)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	reply(w, status, body)
+}
+
+func (a *API) read(h handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) { a.serve(w, r, h) }
+}
+
+// sameOrigin is the CSRF guard: X-Requested-With can't be sent cross-origin without a CORS
+// preflight this server never answers, and an Origin, when there is one, must be ours.
+func (a *API) sameOrigin(r *http.Request) bool {
+	if o := r.Header.Get("Origin"); o != "" && o != a.origin {
+		return false
+	}
+	return r.Header.Get("Sec-Fetch-Site") == "" || r.Header.Get("Sec-Fetch-Site") == "same-origin"
+}
+
+func (a *API) write(h handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Requested-With") != "XMLHttpRequest" || !a.sameOrigin(r) {
+			reply(w, http.StatusForbidden, detail("Cross-origin requests are refused."))
+			return
+		}
+		a.serve(w, r, h)
+	}
+}
+
+func (a *API) session(_ *http.Request, s auth.Session) (int, any, error) {
+	return http.StatusOK, map[string]any{"username": s.Username, "expires": s.Expires.UTC()}, nil
+}
+
+func (a *API) catalog(_ *http.Request, _ auth.Session) (int, any, error) {
+	c := a.machines.Catalog
+	images := make([]map[string]string, 0, len(c.Images))
+	for _, i := range c.Images {
+		images = append(images, map[string]string{"id": i.ID, "name": i.Name, "defaultUser": i.DefaultUser})
+	}
+	return http.StatusOK, map[string]any{"images": images, "sizes": c.Sizes, "disk": c.Disk, "limits": c.Limits}, nil
+}
+
+func (a *API) list(r *http.Request, s auth.Session) (int, any, error) {
+	vms, err := a.machines.List(r.Context(), s.Owner)
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusOK, map[string]any{"vms": vms}, nil
+}
+
+func (a *API) get(r *http.Request, s auth.Session) (int, any, error) {
+	m, err := a.machines.Get(r.Context(), s.Owner, r.PathValue("id"))
+	return http.StatusOK, m, err
+}
+
+func bad(format string, args ...any) error {
+	return &machines.Error{Status: http.StatusBadRequest, Message: fmt.Sprintf(format, args...)}
+}
+
+type createBody struct {
+	Name     string `json:"name"`
+	Image    string `json:"image"`
+	Size     string `json:"size"`
+	DiskGiB  int    `json:"diskGiB"`
+	Password string `json:"password"`
+}
+
+var control = regexp.MustCompile(`[\x00-\x1f\x7f]`)
+
+func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
+	var b createBody
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 16<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&b); err != nil {
+		return 0, nil, bad("The request isn't valid JSON for a new machine.")
+	}
+	c := a.machines.Catalog
+	b.Name = strings.TrimSpace(b.Name)
+	if n := utf8.RuneCountInString(b.Name); n < 1 || n > 63 || control.MatchString(b.Name) {
+		return 0, nil, bad("The name must be 1 to 63 characters.")
+	}
+	img, ok := c.Image(b.Image)
+	if !ok {
+		return 0, nil, bad("There is no image %q.", b.Image)
+	}
+	size, ok := c.Size(b.Size)
+	if !ok {
+		return 0, nil, bad("There is no size %q.", b.Size)
+	}
+	if b.DiskGiB < c.Disk.MinGiB || b.DiskGiB > c.Disk.MaxGiB {
+		return 0, nil, bad("The disk must be %d to %d GiB.", c.Disk.MinGiB, c.Disk.MaxGiB)
+	}
+	if n := utf8.RuneCountInString(b.Password); n < 8 || n > 128 || control.MatchString(b.Password) {
+		return 0, nil, bad("The password must be 8 to 128 characters, without control characters.")
+	}
+	hash, err := machines.HashPassword(b.Password)
+	if err != nil {
+		return 0, nil, err
+	}
+	m, err := a.machines.Create(r.Context(), s.Owner, machines.Request{Name: b.Name, OwnerName: s.Username, Image: img, Size: size, DiskGiB: b.DiskGiB, PasswordHash: hash})
+	return http.StatusCreated, m, err
+}
+
+func (a *API) action(r *http.Request, s auth.Session) (int, any, error) {
+	switch act := r.PathValue("action"); act {
+	case "start", "stop", "restart":
+		return http.StatusNoContent, nil, a.machines.Action(r.Context(), s.Owner, r.PathValue("id"), act)
+	default:
+		return 0, nil, &machines.Error{Status: http.StatusNotFound, Message: "No such action."}
+	}
+}
+
+func (a *API) remove(r *http.Request, s auth.Session) (int, any, error) {
+	return http.StatusNoContent, nil, a.machines.Delete(r.Context(), s.Owner, r.PathValue("id"))
+}
+
+// events is the server-sent event stream of the member's machines: a snapshot, then changes as the
+// informer sees them, until the session expires or the client goes away.
+func (a *API) events(w http.ResponseWriter, r *http.Request) {
+	s, ok := a.auth.Session(r)
+	if !ok {
+		reply(w, http.StatusUnauthorized, detail("Sign in first."))
+		return
+	}
+	release, ok := a.streams.take(s.Owner)
+	if !ok {
+		a.tooMany(w)
+		return
+	}
+	defer release()
+	rc := http.NewResponseController(w)
+	rc.SetReadDeadline(time.Time{}) // a stream, not a request: the server's timeouts don't apply
+	rc.SetWriteDeadline(time.Time{})
+	ctx, cancel := context.WithDeadline(r.Context(), s.Expires)
+	defer cancel()
+
+	// Subscribe before taking the snapshot, so nothing between the two is missed (a change seen in
+	// both is sent twice, which the client treats as the same update).
+	ch, unsubscribe := a.machines.Subscribe(s.Owner)
+	defer unsubscribe()
+	vms, err := a.machines.List(ctx, s.Owner)
+	if err != nil {
+		a.fail(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	send := func(kind string, data any) bool {
+		body, _ := json.Marshal(data)
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", kind, body); err != nil {
+			return false
+		}
+		return rc.Flush() == nil
+	}
+	if !send("snapshot", map[string]any{"vms": vms}) {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case e, open := <-ch:
+			if !open || !send(e.Kind, e.Data) {
+				return
+			}
+		}
+	}
+}
+
+// consoleOf serves a machine's serial ("console") or VNC ("vnc") websocket.
+func (a *API) consoleOf(kind string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		s, ok := a.auth.Session(r)
+		if !ok {
+			reply(w, http.StatusUnauthorized, detail("Sign in first."))
+			return
+		}
+		// Browsers send cookies on cross-site websockets too, and always send Origin on them: it must be ours.
+		if r.Header.Get("Origin") != a.origin {
+			reply(w, http.StatusForbidden, detail("Cross-origin requests are refused."))
+			return
+		}
+		if !console.IsUpgrade(r) {
+			reply(w, http.StatusBadRequest, detail("This is a websocket with the subprotocol "+console.Subprotocol+"."))
+			return
+		}
+		id := r.PathValue("id")
+		running, err := a.machines.Running(r.Context(), s.Owner, id)
+		if err != nil {
+			a.fail(w, err)
+			return
+		}
+		if !running {
+			reply(w, http.StatusConflict, detail("The machine isn't running."))
+			return
+		}
+		release, ok := a.streams.take(s.Owner)
+		if !ok {
+			a.tooMany(w)
+			return
+		}
+		defer release()
+		path := fmt.Sprintf("/apis/subresources.kubevirt.io/v1/namespaces/%s/virtualmachineinstances/%s/%s", a.machines.Namespace, id, kind)
+		err = a.console.Serve(r.Context(), w, r, path, s.Expires)
+		var up *console.UpstreamError
+		var hijacked *console.Hijacked
+		switch {
+		case errors.As(err, &hijacked):
+			a.log.Info("console ended", "id", id, "kind", kind, "err", err) // nothing more can be written
+		case errors.As(err, &up):
+			a.log.Warn("console refused", "id", id, "kind", kind, "status", up.Status, "body", up.Body)
+			reply(w, http.StatusBadGateway, detail("The cluster refused the console."))
+		case err != nil:
+			a.log.Warn("console", "id", id, "kind", kind, "err", err)
+			reply(w, http.StatusBadGateway, detail("The console couldn't be opened."))
+		}
+	}
+}
