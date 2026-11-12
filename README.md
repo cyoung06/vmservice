@@ -36,6 +36,13 @@ It is a Next.js static export served by a small Go binary, on its own origin.
 - **Limits** are per member (machines, vCPUs, memory, disk) and checked in one SERIALIZABLE
   transaction with the insert, so they hold however many requests arrive at once.
 - **Open streams** (live views and consoles) are capped per member (`-max-streams`).
+- **Media**: members upload ISOs and disk images (qcow2, VMDK, raw) or have CDI download them from a
+  URL; admins can list shared ones in the catalog. What a file is (ISO or disk image, and a device
+  profile: `windows`, `linux`, `uefi`, `bios`) comes from its header and from an inspector Job
+  (`vmservice inspect`: the disk mounted read-only, no network; a URL is first probed by a Job that may
+  only reach the internet). A disk image is cloned into a machine's root disk; an ISO is attached as a
+  CD-ROM to a blank disk to install from over VNC, with the virtio driver CD, UEFI + Secure Boot, a TPM
+  and Hyper-V settings for Windows. Eject removes the CD-ROMs.
 - **SSH keys** are registered in the portal (one member per key) and go into each machine created
   afterwards (cloud-init `ssh_authorized_keys`).
 - **The SSH bastion** is a separate process, `vmservice bastion`, so the public SSH port sits behind
@@ -80,6 +87,12 @@ vmservice -namespace vms -catalog /etc/vmservice/catalog.yaml -origin https://vm
 | `-session-lifetime` | `168h` | how long a sign-in lasts |
 | `-max-streams` | `8` | open consoles and live views per member, together |
 | `-ssh-public` | | the bastion's `host:port` as members reach it, shown in the UI; empty: none |
+| `-inspect-image` | (required) | the image the media inspector Jobs run: this vmservice's own |
+| `-inspect-pull-secret` | | its image pull secret |
+| `-cdi-upload-proxy` | `https://cdi-uploadproxy.cdi.svc` | CDI's upload proxy, for media uploads |
+| `-cdi-upload-ca` | `cdi/cdi-uploadproxy-signer-bundle` | the ConfigMap with its CA |
+| `-virtio-drivers-image` | `quay.io/kubevirt/virtio-container-disk:v1.9.1` | the driver CD for Windows installs |
+| `-icons` | | a directory with `favicon.svg`, `favicon.ico`, `apple-touch-icon.png` (any may be missing) |
 | `-bastion-db-role` | | the bastion's database role, granted read on members, machines and ssh_keys at every start |
 
 `vmservice bastion` takes `-namespace`, `-database-url-file` (its read-only role), `-listen`

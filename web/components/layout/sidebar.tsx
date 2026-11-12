@@ -53,6 +53,9 @@ export const Sidebar = () => {
             <SidebarLink href="/new" icon={<Icon name="plus" size={15} />}>
               New machine
             </SidebarLink>
+            <SidebarLink href="/media" icon={<Icon name="hard-drive" size={15} />}>
+              Media
+            </SidebarLink>
             <SidebarLink href="/keys" icon={<Icon name="key" size={15} />}>
               SSH keys
             </SidebarLink>

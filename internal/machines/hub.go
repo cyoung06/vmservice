@@ -12,8 +12,9 @@ type Event struct {
 // change says a machine of owner changed. It carries no state: the hub reads the machine from the
 // cache when it sends, so an event can never carry a state older than one sent before it.
 type change struct {
-	owner string
-	id    string
+	owner  string
+	id     string
+	medium bool // a medium, not a machine
 }
 
 type subscriber struct {

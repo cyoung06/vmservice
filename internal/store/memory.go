@@ -17,12 +17,13 @@ type Memory struct {
 	signedIn map[string]time.Time
 	machines map[string]Machine
 	keys     map[string]Key
+	media    map[string]Medium
 	clock    time.Time
 }
 
 // NewMemory is an empty Memory store.
 func NewMemory() *Memory {
-	return &Memory{members: map[string]string{}, signedIn: map[string]time.Time{}, machines: map[string]Machine{}, keys: map[string]Key{}, clock: time.Unix(1_800_000_000, 0)}
+	return &Memory{members: map[string]string{}, signedIn: map[string]time.Time{}, machines: map[string]Machine{}, keys: map[string]Key{}, media: map[string]Medium{}, clock: time.Unix(1_800_000_000, 0)}
 }
 
 func (m *Memory) now() time.Time { m.clock = m.clock.Add(time.Second); return m.clock }
@@ -192,5 +193,61 @@ func (m *Memory) DeleteKey(_ context.Context, owner, id string) error {
 		return ErrNotFound
 	}
 	delete(m.keys, id)
+	return nil
+}
+
+func (m *Memory) AddMedium(_ context.Context, x Medium) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.members[x.Owner]; !ok {
+		return fmt.Errorf("owner %q isn't a member (foreign key)", x.Owner)
+	}
+	if _, ok := m.media[x.ID]; ok {
+		return ErrExists
+	}
+	x.CreatedAt = m.now()
+	m.media[x.ID] = x
+	return nil
+}
+
+func (m *Memory) Medium(_ context.Context, id string) (Medium, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	x, ok := m.media[id]
+	if !ok {
+		return Medium{}, ErrNotFound
+	}
+	return x, nil
+}
+
+func (m *Memory) Media(_ context.Context, owner string) ([]Medium, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Medium
+	for _, x := range m.media {
+		if x.Owner == owner {
+			out = append(out, x)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) SetMediumProfile(_ context.Context, id, profile string, virtualBytes int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	x, ok := m.media[id]
+	if ok {
+		x.Profile = profile
+		x.VirtualBytes = max(x.VirtualBytes, virtualBytes)
+		m.media[id] = x
+	}
+	return nil
+}
+
+func (m *Memory) DeleteMedium(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.media, id)
 	return nil
 }

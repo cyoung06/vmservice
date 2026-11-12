@@ -13,9 +13,11 @@ import (
 // Catalog is the -catalog file.
 type Catalog struct {
 	Images []Image `json:"images"`
-	Sizes  []Size  `json:"sizes"`
-	Disk   Disk    `json:"disk"`
-	Limits Limits  `json:"limits"`
+	// Media are shared ISOs and disk images every member may make machines from.
+	Media  []SharedMedium `json:"media,omitempty"`
+	Sizes  []Size         `json:"sizes"`
+	Disk   Disk           `json:"disk"`
+	Limits Limits         `json:"limits"`
 	// StorageClass is the class of the machines' disks; empty: the cluster's default.
 	StorageClass string `json:"storageClass,omitempty"`
 }
@@ -31,6 +33,15 @@ type Image struct {
 	// CloudConfig is merged into the generated #cloud-config (e.g. apt mirrors). Keys the service
 	// sets itself (hostname, chpasswd, ssh_pwauth) can't be overridden.
 	CloudConfig map[string]any `json:"cloudConfig,omitempty"`
+}
+
+// SharedMedium is an ISO or disk image an admin provides: a PVC in the machines' namespace.
+type SharedMedium struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Source  string `json:"source"`  // the PVC (usually a DataVolume's)
+	Kind    string `json:"kind"`    // iso, disk
+	Profile string `json:"profile"` // windows, linux, uefi, bios
 }
 
 // Size is a CPU and memory preset.
@@ -88,6 +99,16 @@ func (c *Catalog) check() error {
 		}
 		seen["image/"+i.ID] = true
 	}
+	for _, m := range c.Media {
+		if !id.MatchString(m.ID) || !id.MatchString(m.Source) || m.Name == "" || (m.Kind != "iso" && m.Kind != "disk") ||
+			!map[string]bool{"windows": true, "linux": true, "uefi": true, "bios": true}[m.Profile] {
+			return fmt.Errorf("medium %q: needs an id, a source PVC, a name, kind iso|disk and profile windows|linux|uefi|bios", m.ID)
+		}
+		if seen["medium/"+m.ID] {
+			return fmt.Errorf("medium %q is listed twice", m.ID)
+		}
+		seen["medium/"+m.ID] = true
+	}
 	for _, s := range c.Sizes {
 		if !id.MatchString(s.ID) || s.Name == "" || s.CPU < 1 || s.MemoryMiB < 256 {
 			return fmt.Errorf("size %q: needs an id, a name, cpu >= 1 and memoryMiB >= 256", s.ID)
@@ -126,4 +147,14 @@ func (c *Catalog) Size(id string) (Size, bool) {
 		}
 	}
 	return Size{}, false
+}
+
+// SharedMedium returns the shared medium with id, if any.
+func (c *Catalog) SharedMedium(id string) (SharedMedium, bool) {
+	for _, m := range c.Media {
+		if m.ID == id {
+			return m, true
+		}
+	}
+	return SharedMedium{}, false
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/GehirnInc/crypt/sha512_crypt"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
@@ -40,9 +41,10 @@ func testService(t *testing.T) (*Service, *[]string) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	corev1.AddToScheme(scheme)
+	batchv1.AddToScheme(scheme)
 	kubevirtv1.AddToScheme(scheme)
 	cdiv1.AddToScheme(scheme)
-	c := fake.NewClientBuilder().WithScheme(scheme).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&cdiv1.DataVolume{}).Build()
 	var mu sync.Mutex
 	calls := &[]string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +66,7 @@ func testService(t *testing.T) (*Service, *[]string) {
 	st.UpsertMember(ctx, "bob", "bob")
 	s := &Service{
 		Namespace: "cloud", Catalog: catalog, Config: &rest.Config{Host: srv.URL},
-		read: c, write: c, store: st, http: srv.Client(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		read: c, write: c, watch: c, store: st, http: srv.Client(), log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	s.hub = newHub(ctx, s.render)
 	return s, calls

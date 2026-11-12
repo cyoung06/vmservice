@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/cyoung06/vmservice/internal/auth"
+	"github.com/cyoung06/vmservice/internal/config"
 	"github.com/cyoung06/vmservice/internal/console"
 	"github.com/cyoung06/vmservice/internal/limit"
 	"github.com/cyoung06/vmservice/internal/machines"
@@ -49,6 +50,11 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/vms", a.write(a.create))
 	mux.HandleFunc("POST /api/vms/{id}/{action}", a.write(a.action))
 	mux.HandleFunc("DELETE /api/vms/{id}", a.write(a.remove))
+	mux.HandleFunc("GET /api/media", a.read(a.media))
+	mux.HandleFunc("GET /api/media/{id}", a.read(a.medium))
+	mux.HandleFunc("POST /api/media", a.write(a.addMedium))
+	mux.HandleFunc("PUT /api/media/{id}/upload", noDeadlines(a.write(a.upload)))
+	mux.HandleFunc("DELETE /api/media/{id}", a.write(a.deleteMedium))
 	mux.HandleFunc("GET /api/keys", a.read(a.keys))
 	mux.HandleFunc("POST /api/keys", a.write(a.addKey))
 	mux.HandleFunc("DELETE /api/keys/{id}", a.write(a.deleteKey))
@@ -152,6 +158,8 @@ func bad(format string, args ...any) error {
 type createBody struct {
 	Name     string `json:"name"`
 	Image    string `json:"image"`
+	Media    string `json:"media"`
+	Profile  string `json:"profile"`
 	Size     string `json:"size"`
 	DiskGiB  int    `json:"diskGiB"`
 	Password string `json:"password"`
@@ -172,7 +180,7 @@ func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
 		return 0, nil, bad("The name must be 1 to 63 characters.")
 	}
 	img, ok := c.Image(b.Image)
-	if !ok {
+	if !ok && b.Media == "" {
 		return 0, nil, bad("There is no image %q.", b.Image)
 	}
 	size, ok := c.Size(b.Size)
@@ -197,8 +205,66 @@ func (a *API) create(r *http.Request, s auth.Session) (int, any, error) {
 			return 0, nil, err
 		}
 	}
-	m, err := a.machines.Create(r.Context(), s.Owner, machines.Request{Name: b.Name, OwnerName: s.Username, Image: img, Size: size, DiskGiB: b.DiskGiB, PasswordHash: hash})
+	if b.Media != "" {
+		img = config.Image{} // the medium decides
+	}
+	m, err := a.machines.Create(r.Context(), s.Owner, machines.Request{Name: b.Name, OwnerName: s.Username, Image: img, Size: size, DiskGiB: b.DiskGiB, PasswordHash: hash,
+		MediaID: b.Media, ProfileOverride: b.Profile})
 	return http.StatusCreated, m, err
+}
+
+func (a *API) media(r *http.Request, s auth.Session) (int, any, error) {
+	list, err := a.machines.Media(r.Context(), s.Owner)
+	if err != nil {
+		return 0, nil, err
+	}
+	return http.StatusOK, map[string]any{"media": list}, nil
+}
+
+func (a *API) medium(r *http.Request, s auth.Session) (int, any, error) {
+	m, err := a.machines.GetMedium(r.Context(), s.Owner, r.PathValue("id"))
+	return http.StatusOK, m, err
+}
+
+func (a *API) addMedium(r *http.Request, s auth.Session) (int, any, error) {
+	var b struct {
+		Name      string `json:"name"`
+		Source    string `json:"source"`
+		SizeBytes int64  `json:"sizeBytes"`
+		Header    []byte `json:"header"` // base64 in JSON
+		URL       string `json:"url"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 256<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&b); err != nil {
+		return 0, nil, bad("The request isn't valid JSON for a medium.")
+	}
+	if err := a.machines.EnsureMember(r.Context(), s.Owner, s.Username); err != nil {
+		return 0, nil, err
+	}
+	var m machines.Medium
+	var err error
+	switch b.Source {
+	case "upload":
+		m, err = a.machines.AddUpload(r.Context(), s.Owner, b.Name, b.SizeBytes, b.Header)
+	case "url":
+		m, err = a.machines.AddURL(r.Context(), s.Owner, b.Name, b.URL)
+	default:
+		return 0, nil, bad(`The source must be "upload" or "url".`)
+	}
+	return http.StatusCreated, m, err
+}
+
+// upload streams the file in the body to the medium; it takes as long as the upload does.
+func (a *API) upload(r *http.Request, s auth.Session) (int, any, error) {
+	if r.ContentLength <= 0 {
+		return 0, nil, bad("Send the file as the body, with its Content-Length.")
+	}
+	return http.StatusNoContent, nil, a.machines.Upload(r.Context(), s.Owner, r.PathValue("id"), r.Body, r.ContentLength)
+}
+
+func (a *API) deleteMedium(r *http.Request, s auth.Session) (int, any, error) {
+	return http.StatusNoContent, nil, a.machines.DeleteMedium(r.Context(), s.Owner, r.PathValue("id"))
 }
 
 func (a *API) keys(r *http.Request, s auth.Session) (int, any, error) {
@@ -234,6 +300,8 @@ func (a *API) action(r *http.Request, s auth.Session) (int, any, error) {
 	switch act := r.PathValue("action"); act {
 	case "start", "stop", "restart":
 		return http.StatusNoContent, nil, a.machines.Action(r.Context(), s.Owner, r.PathValue("id"), act)
+	case "eject":
+		return http.StatusNoContent, nil, a.machines.Eject(r.Context(), s.Owner, r.PathValue("id"))
 	default:
 		return 0, nil, &machines.Error{Status: http.StatusNotFound, Message: "No such action."}
 	}
@@ -344,5 +412,16 @@ func (a *API) consoleOf(kind string) http.HandlerFunc {
 			a.log.Warn("console", "id", id, "kind", kind, "err", err)
 			reply(w, http.StatusBadGateway, detail("The console couldn't be opened."))
 		}
+	}
+}
+
+// noDeadlines lifts the server's read and write timeouts for one long request (an upload of
+// several GB).
+func noDeadlines(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		rc.SetReadDeadline(time.Time{})
+		rc.SetWriteDeadline(time.Time{})
+		h(w, r)
 	}
 }

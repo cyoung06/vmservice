@@ -72,7 +72,7 @@ A machine:
 | --- | --- |
 | `GET /api/vms` | `{"vms": [machine, ...]}`: the caller's machines, newest first |
 | `GET /api/vms/{id}` | a machine; `404` if it doesn't exist or isn't the caller's |
-| `POST /api/vms` | body `{"name", "image", "size", "diskGiB", "password"}` → `201` machine. `400` for a bad field, `403` when over a limit. Creates run one at a time, so the limits hold however many arrive at once |
+| `POST /api/vms` | body `{"name", "image", "size", "diskGiB", "password"}` or, from media, `{"name", "media", "profile", "size", "diskGiB", "password"}` → `201` machine. `400` for a bad field, `403` when over a limit. Creates run one at a time, so the limits hold however many arrive at once |
 | `POST /api/vms/{id}/start` | `204` |
 | `POST /api/vms/{id}/stop` | `204` |
 | `POST /api/vms/{id}/restart` | `204` |
@@ -133,3 +133,52 @@ A key:
 The jump host takes any username: the key says who you are. It allows nothing but forwarding to port
 22 of a running machine of yours (no shell, no other ports or hosts). The host name is the machine id,
 or its display name when that's a valid host name and no other machine of yours has it (ignoring case).
+
+## Media
+
+ISOs (installers) and disk images members bring, plus shared ones from the catalog. A machine can be
+made from one (`POST /api/vms` with `media`).
+
+A medium:
+
+```json
+{
+  "id": "md-3kq8zp",            // shared ones: the catalog id, e.g. "win11-eval"
+  "name": "Windows 11",
+  "shared": false,
+  "source": "upload",           // "upload", "url" or "shared"
+  "kind": "iso",                // "iso", "disk" or "" (not known yet)
+  "profile": "windows",         // "windows", "linux", "uefi", "bios" or "" (detected; a machine may override)
+  "sizeBytes": 6123456789,      // the file; for disks, "virtualBytes" is the disk it holds
+  "virtualBytes": 6123456789,
+  "state": "Ready",             // "Uploading" (waiting for the file), "Importing", "Inspecting", "Ready", "Failed"
+  "progress": "45.2%",          // while importing/uploading, else ""
+  "detail": "",                 // why it failed, when it did
+  "createdAt": "2026-11-13T10:00:00Z"
+}
+```
+
+| | |
+| --- | --- |
+| `GET /api/media` | `{"media": [medium, ...]}`: the caller's and the shared ones, newest first |
+| `GET /api/media/{id}` | a medium (the caller's or a shared one) |
+| `POST /api/media` | upload: body `{"name", "source": "upload", "sizeBytes", "header"}` where `header` is the base64 of the file's first 64 KiB (the browser reads it locally; it says whether this is an ISO or a disk image and how big the disk is). URL: `{"name", "source": "url", "url"}` (http or https; CDI downloads it in the cluster). → `201` medium |
+| `PUT /api/media/{id}/upload` | the file as the raw body, `Content-Length` set, once the medium was created with `source: "upload"`. Stream it (e.g. `XMLHttpRequest` with `upload.onprogress`); answered when the upload is done. `409` if it isn't waiting for a file |
+| `DELETE /api/media/{id}` | `204`; the caller's own only. Machines made from it keep their copy |
+
+`name`: 1–63 characters, display only. Media changes come over the same event stream as machines:
+event `medium` (data: the medium) and `medium-deleted` (data: `{"id"}`).
+
+Machines from media:
+- **`kind: "disk"`:** the disk is copied into the machine's root disk and booted, with the same
+  cloud-init disk as images (keys, password and host name apply if the image runs cloud-init).
+  `diskGiB` must be at least the image's `virtualBytes`.
+- **`kind: "iso"`:** the machine gets a blank root disk of `diskGiB` and the ISO as a CD-ROM to
+  install from (over VNC). `profile: "windows"` adds the virtio driver CD, UEFI with Secure Boot, a
+  TPM and Hyper-V settings, and no cloud-init (the installer sets the password); others attach the
+  cloud-init disk too.
+- `profile` (optional) overrides the detected one.
+- Such machines carry `"media"`, `"profile"` and `"installMedia": true` while the CD-ROMs are attached.
+
+`POST /api/vms/{id}/eject` → `204`: removes the CD-ROMs (the ISO and the driver CD) so the machine boots
+from its disk; it restarts if it's running.

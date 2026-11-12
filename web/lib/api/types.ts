@@ -22,6 +22,12 @@ export type Machine = {
   readonly state: MachineState;
   readonly detail: string;
   readonly createdAt: string;
+  /** Made from media: the medium's id, else absent or "". */
+  readonly media?: string;
+  /** Made from media: the OS profile ("windows", "linux", "uefi", "bios"). */
+  readonly profile?: string;
+  /** The install CD-ROMs (ISO, drivers) are still attached; "eject" removes them. */
+  readonly installMedia?: boolean;
 };
 
 export type CatalogImage = { readonly id: string; readonly name: string; readonly defaultUser: string };
@@ -43,13 +49,46 @@ export type Catalog = {
 
 export type SessionInfo = { readonly username: string; readonly expires: string };
 
-export type NewMachineRequest = {
+export type NewMachineRequest =
+  | {
+      readonly name: string;
+      readonly image: string;
+      readonly size: string;
+      readonly diskGiB: number;
+      readonly password: string;
+    }
+  | {
+      readonly name: string;
+      readonly media: string;
+      readonly profile: string;
+      readonly size: string;
+      readonly diskGiB: number;
+      readonly password: string;
+    };
+
+export type MediumKind = "iso" | "disk" | "";
+export type MediumProfile = "windows" | "linux" | "uefi" | "bios" | "";
+export type MediumState = "Uploading" | "Importing" | "Inspecting" | "Ready" | "Failed";
+
+/** An ISO or disk image a member brought, or a shared one from the catalog (GET /api/media). */
+export type Medium = {
+  readonly id: string;
   readonly name: string;
-  readonly image: string;
-  readonly size: string;
-  readonly diskGiB: number;
-  readonly password: string;
+  readonly shared: boolean;
+  readonly source: "upload" | "url" | "shared";
+  readonly kind: MediumKind;
+  readonly profile: MediumProfile;
+  readonly sizeBytes: number;
+  readonly virtualBytes: number;
+  readonly state: MediumState;
+  readonly progress: string;
+  readonly detail: string;
+  readonly createdAt: string;
 };
+
+export type NewMediumRequest =
+  | { readonly name: string; readonly source: "upload"; readonly sizeBytes: number; readonly header: string }
+  | { readonly name: string; readonly source: "url"; readonly url: string };
 
 /** A member's SSH public key (GET /api/keys). */
 export type SshKey = {

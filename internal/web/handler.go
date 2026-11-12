@@ -31,7 +31,16 @@ type Config struct {
 	LoginProvider string `json:"loginProvider"`
 	// SSH is how members reach the bastion; nil when it's off.
 	SSH *SSH `json:"ssh"`
+	// Icons are the deployment's site icons by file name: favicon.svg, favicon.ico and
+	// apple-touch-icon.png (180 px). A missing SVG is a plain default; the others are then 404.
+	Icons map[string][]byte `json:"-"`
 }
+
+// IconFiles are the icon file names served at the root.
+var IconFiles = map[string]string{"favicon.svg": "image/svg+xml", "favicon.ico": "image/x-icon", "apple-touch-icon.png": "image/png"}
+
+// defaultFavicon is a plain monitor glyph.
+const defaultFavicon = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect x="3" y="5" width="26" height="17" rx="3" fill="#1f2937"/><rect x="6" y="8" width="20" height="11" rx="1.5" fill="#60a5fa"/><rect x="12" y="24" width="8" height="3" rx="1" fill="#1f2937"/></svg>`
 
 // SSH is the bastion's public address, as members type it after ssh -J.
 type SSH struct {
@@ -102,6 +111,22 @@ func Handler(files fs.FS, cfg Config, origin string, routes ...func(*http.ServeM
 		add(mux)
 	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
+	for name, contentType := range IconFiles {
+		data := cfg.Icons[name]
+		if len(data) == 0 && name == "favicon.svg" {
+			data = []byte(defaultFavicon)
+		}
+		if len(data) == 0 {
+			continue // not configured: the export's 404 page
+		}
+		mux.HandleFunc("GET /"+name, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", contentType)
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			// Opened on its own, an SVG is a document: no scripts, only its own embedded images.
+			w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+			w.Write(data)
+		})
+	}
 	mux.HandleFunc("GET /config.json", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")

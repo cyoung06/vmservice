@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,6 +27,7 @@ import (
 	"github.com/cyoung06/vmservice/internal/bastion"
 	"github.com/cyoung06/vmservice/internal/config"
 	"github.com/cyoung06/vmservice/internal/console"
+	"github.com/cyoung06/vmservice/internal/inspect"
 	"github.com/cyoung06/vmservice/internal/limit"
 	"github.com/cyoung06/vmservice/internal/machines"
 	"github.com/cyoung06/vmservice/internal/store"
@@ -51,6 +54,9 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "bastion" {
 		os.Exit(runBastion(log, os.Args[2:]))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "inspect" {
+		os.Exit(runInspect(os.Args[2:]))
+	}
 	var a auth.Config
 	var ui web.Config
 	listen := flag.String("listen", ":8080", "listen address (plain HTTP; TLS terminates in front)")
@@ -68,13 +74,20 @@ func main() {
 	flag.DurationVar(&a.Lifetime, "session-lifetime", 7*24*time.Hour, "how long a sign-in lasts; also how long a removed member keeps access")
 	maxStreams := flag.Int("max-streams", 8, "open consoles and live views per member, together")
 	sshPublic := flag.String("ssh-public", "", "the bastion's address as members reach it, host:port, shown in the UI (empty: none); the bastion itself is \"vmservice bastion\"")
+	var media machines.MediaConfig
+	flag.StringVar(&media.UploadProxy, "cdi-upload-proxy", "https://cdi-uploadproxy.cdi.svc", "CDI's upload proxy, for media uploads")
+	flag.StringVar(&media.UploadCA, "cdi-upload-ca", "cdi/cdi-uploadproxy-signer-bundle", "namespace/name of the ConfigMap holding the upload proxy's CA")
+	flag.StringVar(&media.InspectImage, "inspect-image", "", "the image the media inspector Jobs run: this vmservice's own (required)")
+	flag.StringVar(&media.PullSecret, "inspect-pull-secret", "", "image pull secret for -inspect-image")
+	flag.StringVar(&media.DriversImage, "virtio-drivers-image", "quay.io/kubevirt/virtio-container-disk:v1.9.1", "the virtio driver CD attached to Windows installs")
 	bastionRole := flag.String("bastion-db-role", "", "a database role the bastion runs as: granted read on members, machines and ssh_keys at every start (empty: none)")
+	iconsDir := flag.String("icons", "", "a directory with the site's icons: favicon.svg, favicon.ico, apple-touch-icon.png (any may be missing)")
 	flag.StringVar(&ui.Title, "title", "VMService", "name shown in the sidebar and the tab title")
 	flag.StringVar(&ui.LoginProvider, "login-provider", "", "the sign-in provider's name for the button, e.g. \"Keycloak\" (empty: \"Sign in\")")
 	flag.Parse()
 
 	for name, v := range map[string]string{"namespace": *namespace, "catalog": *catalogFile, "database-url-file": *databaseURLFile, "origin": a.Origin, "oidc-issuer": a.Issuer,
-		"oidc-client-id": a.ClientID, "oidc-client-secret-file": *clientSecretFile, "session-key-file": a.KeyFile} {
+		"oidc-client-id": a.ClientID, "inspect-image": media.InspectImage, "oidc-client-secret-file": *clientSecretFile, "session-key-file": a.KeyFile} {
 		if v == "" {
 			log.Error("-" + name + " is required")
 			os.Exit(2)
@@ -122,10 +135,19 @@ func main() {
 		log.Error("machines", "err", err)
 		os.Exit(1)
 	}
+	vms.MediaConfig = media
 	proxy, err := console.New(kube, machines.APIServer(kube))
 	if err != nil {
 		log.Error("console", "err", err)
 		os.Exit(1)
+	}
+	if *iconsDir != "" {
+		ui.Icons = map[string][]byte{}
+		for name := range web.IconFiles {
+			if data, err := os.ReadFile(filepath.Join(*iconsDir, name)); err == nil {
+				ui.Icons[name] = data
+			}
+		}
 	}
 	streams := &limit.PerOwner{Max: int64(*maxStreams)}
 	if ui.SSH, err = publicSSH(*sshPublic); err != nil {
@@ -208,5 +230,41 @@ func runBastion(log *slog.Logger, args []string) int {
 		log.Error("bastion", "err", err)
 		return 1
 	}
+	return 0
+}
+
+// runInspect is "vmservice inspect -file F | -url U", run in the inspector Jobs: it prints what the
+// file is (inspect.Result) as JSON, or {"error": "..."}, to stdout and the termination log, which
+// the portal reads. It always exits 0 so a readable answer is never a failed Job.
+func runInspect(args []string) int {
+	fs := flag.NewFlagSet("inspect", flag.ExitOnError)
+	file := fs.String("file", "", "a file to inspect (a medium's disk.img)")
+	u := fs.String("url", "", "a URL to probe (its first 64 KiB)")
+	fs.Parse(args)
+	var r inspect.Result
+	var err error
+	switch {
+	case *file != "":
+		var f *os.File
+		if f, err = os.Open(*file); err == nil {
+			var st os.FileInfo
+			if st, err = f.Stat(); err == nil {
+				r, err = inspect.File(f, st.Size())
+			}
+			f.Close()
+		}
+	case *u != "":
+		r, err = inspect.Probe(context.Background(), *u)
+	default:
+		err = fmt.Errorf("give -file or -url")
+	}
+	var out []byte
+	if err != nil {
+		out, _ = json.Marshal(map[string]string{"error": err.Error()})
+	} else {
+		out, _ = json.Marshal(r)
+	}
+	os.Stdout.Write(append(out, '\n'))
+	os.WriteFile("/dev/termination-log", out, 0o644)
 	return 0
 }

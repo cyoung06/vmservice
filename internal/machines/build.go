@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"time"
 
@@ -29,18 +30,21 @@ const (
 
 // Machine is a member's VM as the API shows it.
 type Machine struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Image       string    `json:"image"`
-	ImageName   string    `json:"imageName"`
-	DefaultUser string    `json:"defaultUser"`
-	Size        string    `json:"size"`
-	CPU         int       `json:"cpu"`
-	MemoryMiB   int       `json:"memoryMiB"`
-	DiskGiB     int       `json:"diskGiB"`
-	State       string    `json:"state"`
-	Detail      string    `json:"detail"`
-	CreatedAt   time.Time `json:"createdAt"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Image        string    `json:"image"`
+	ImageName    string    `json:"imageName"`
+	DefaultUser  string    `json:"defaultUser"`
+	Size         string    `json:"size"`
+	CPU          int       `json:"cpu"`
+	MemoryMiB    int       `json:"memoryMiB"`
+	DiskGiB      int       `json:"diskGiB"`
+	Media        string    `json:"media,omitempty"`   // the medium it was made from
+	Profile      string    `json:"profile,omitempty"` // its device profile (from media)
+	InstallMedia bool      `json:"installMedia"`      // its install CD-ROMs are still attached (Eject)
+	State        string    `json:"state"`
+	Detail       string    `json:"detail"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
 // Request is what a member asks for in POST /api/vms, after checking.
@@ -57,7 +61,21 @@ type Request struct {
 	PasswordHash string
 	// AuthorizedKeys are the default user's SSH keys (authorized_keys lines); filled by Create.
 	AuthorizedKeys []string
+	// MediaID and ProfileOverride make the machine from a medium instead of Image.
+	MediaID         string
+	ProfileOverride string
+	media           *mediaRef // resolved by Create
+	profile         string    // the profile it gets
+	driversImage    string
 }
+
+// Volumes of a machine made from an ISO, removed by Eject.
+const (
+	volumeInstall = "install" // the ISO, cloned per machine
+	volumeDrivers = "drivers" // the virtio driver CD (Windows)
+)
+
+func installName(id string) string { return id + "-install" }
 
 const idAlphabet = "abcdefghijkmnpqrstuvwxyz23456789" // no 0/o, 1/l
 
@@ -98,7 +116,7 @@ func buildVM(namespace, id, owner, storageClass string, r Request) *kubevirtv1.V
 	if storageClass != "" {
 		storage.StorageClassName = &storageClass
 	}
-	return &kubevirtv1.VirtualMachine{
+	vm := &kubevirtv1.VirtualMachine{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: id, Namespace: namespace, Labels: labels,
 			Annotations: map[string]string{AnnotationUser: r.OwnerName}, // for admins; the row is the authority
@@ -143,6 +161,8 @@ func buildVM(namespace, id, owner, storageClass string, r Request) *kubevirtv1.V
 			},
 		},
 	}
+	applyMedia(vm, id, storage, r)
+	return vm
 }
 
 // cloudConfig is the machine's #cloud-config: the image's extras, then what the service sets,
@@ -159,7 +179,7 @@ func cloudConfig(id string, r Request) ([]byte, error) {
 		doc["ssh_authorized_keys"] = r.AuthorizedKeys
 	}
 	delete(doc, "chpasswd") // the member's password or none, never the image's extras
-	if r.PasswordHash != "" {
+	if r.PasswordHash != "" && r.Image.DefaultUser != "" {
 		doc["chpasswd"] = map[string]any{
 			"expire": false,
 			"users":  []any{map[string]any{"name": r.Image.DefaultUser, "password": r.PasswordHash, "type": "hash"}},
@@ -197,6 +217,7 @@ func toMachine(row store.Machine, vm *kubevirtv1.VirtualMachine, disk *cdiv1.Dat
 	m := Machine{
 		ID: row.ID, Name: row.Name, Image: row.Image, ImageName: row.Image, Size: row.Size,
 		CPU: row.CPU, MemoryMiB: row.MemoryMiB, DiskGiB: row.DiskGiB, CreatedAt: row.CreatedAt.UTC(),
+		Media: row.Media, Profile: row.Profile, InstallMedia: hasInstallMedia(vm),
 	}
 	if img, ok := catalog.Image(m.Image); ok {
 		m.ImageName, m.DefaultUser = img.Name, img.DefaultUser
@@ -248,4 +269,85 @@ func state(vm *kubevirtv1.VirtualMachine, disk *cdiv1.DataVolume) (string, strin
 		}
 	}
 	return "Error", detail
+}
+
+// applyMedia turns an image machine into one made from a medium: a disk image is cloned into the
+// root disk; an ISO gets a blank root disk and is attached as a CD-ROM (a per-machine clone) to
+// install from. The profile sets the firmware and devices; Windows also gets the virtio driver CD,
+// Secure Boot with a TPM, Hyper-V enlightenments, and no cloud-init (Setup sets the password).
+func applyMedia(vm *kubevirtv1.VirtualMachine, id string, storage *cdiv1.StorageSpec, r Request) {
+	if r.media == nil {
+		return
+	}
+	spec := &vm.Spec.Template.Spec
+	root := &vm.Spec.DataVolumeTemplates[0].Spec
+	switch r.media.Kind {
+	case "disk":
+		root.Source = &cdiv1.DataVolumeSource{PVC: &cdiv1.DataVolumeSourcePVC{Namespace: vm.Namespace, Name: r.media.PVC}}
+	case "iso":
+		root.Source = &cdiv1.DataVolumeSource{Blank: &cdiv1.DataVolumeBlankImage{}}
+		iso := storage.DeepCopy()
+		iso.Resources.Requests[corev1.ResourceStorage] = *resource.NewQuantity(r.media.PVCBytes, resource.BinarySI)
+		vm.Spec.DataVolumeTemplates = append(vm.Spec.DataVolumeTemplates, kubevirtv1.DataVolumeTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Name: installName(id), Labels: vm.Spec.DataVolumeTemplates[0].Labels},
+			Spec: cdiv1.DataVolumeSpec{
+				Source:  &cdiv1.DataVolumeSource{PVC: &cdiv1.DataVolumeSourcePVC{Namespace: vm.Namespace, Name: r.media.PVC}},
+				Storage: iso,
+			},
+		})
+		one, two := uint(1), uint(2)
+		spec.Domain.Devices.Disks[0].BootOrder = &two
+		spec.Domain.Devices.Disks = append(spec.Domain.Devices.Disks, kubevirtv1.Disk{
+			Name: volumeInstall, BootOrder: &one,
+			DiskDevice: kubevirtv1.DiskDevice{CDRom: &kubevirtv1.CDRomTarget{Bus: kubevirtv1.DiskBusSATA}},
+		})
+		spec.Volumes = append(spec.Volumes, kubevirtv1.Volume{Name: volumeInstall,
+			VolumeSource: kubevirtv1.VolumeSource{DataVolume: &kubevirtv1.DataVolumeSource{Name: installName(id)}}})
+	}
+	no, yes := false, true
+	switch r.profile {
+	case "uefi", "linux":
+		spec.Domain.Firmware = &kubevirtv1.Firmware{Bootloader: &kubevirtv1.Bootloader{EFI: &kubevirtv1.EFI{SecureBoot: &no}}}
+	case "windows":
+		spec.Domain.Machine = &kubevirtv1.Machine{Type: "q35"}
+		spec.Domain.Firmware = &kubevirtv1.Firmware{Bootloader: &kubevirtv1.Bootloader{EFI: &kubevirtv1.EFI{SecureBoot: &yes}}}
+		on := &kubevirtv1.FeatureState{}
+		spec.Domain.Features = &kubevirtv1.Features{
+			ACPI: kubevirtv1.FeatureState{}, APIC: &kubevirtv1.FeatureAPIC{}, SMM: &kubevirtv1.FeatureState{},
+			Hyperv: &kubevirtv1.FeatureHyperv{
+				Relaxed: on, VAPIC: on, VPIndex: on, Runtime: on, SyNIC: on, Reset: on, Frequencies: on,
+				Reenlightenment: on, IPI: on, Spinlocks: &kubevirtv1.FeatureSpinlocks{Retries: ptrUint32(8191)},
+				SyNICTimer: &kubevirtv1.SyNICTimer{}, TLBFlush: &kubevirtv1.TLBFlush{},
+			},
+		}
+		spec.Domain.Clock = &kubevirtv1.Clock{ClockOffset: kubevirtv1.ClockOffset{UTC: &kubevirtv1.ClockOffsetUTC{}},
+			Timer: &kubevirtv1.Timer{HPET: &kubevirtv1.HPETTimer{Enabled: &no}, PIT: &kubevirtv1.PITTimer{TickPolicy: kubevirtv1.PITTickPolicyDelay},
+				RTC: &kubevirtv1.RTCTimer{TickPolicy: kubevirtv1.RTCTickPolicyCatchup}, Hyperv: &kubevirtv1.HypervTimer{}}}
+		spec.Domain.Devices.TPM = &kubevirtv1.TPMDevice{Persistent: &yes}
+		spec.Domain.Devices.Inputs = []kubevirtv1.Input{{Name: "tablet", Type: kubevirtv1.InputTypeTablet, Bus: kubevirtv1.InputBusUSB}}
+		// no cloud-init: drop its disk and volume
+		spec.Domain.Devices.Disks = slices.DeleteFunc(spec.Domain.Devices.Disks, func(d kubevirtv1.Disk) bool { return d.Name == "cloudinit" })
+		spec.Volumes = slices.DeleteFunc(spec.Volumes, func(v kubevirtv1.Volume) bool { return v.Name == "cloudinit" })
+		if r.media.Kind == "iso" && r.driversImage != "" {
+			spec.Domain.Devices.Disks = append(spec.Domain.Devices.Disks, kubevirtv1.Disk{Name: volumeDrivers,
+				DiskDevice: kubevirtv1.DiskDevice{CDRom: &kubevirtv1.CDRomTarget{Bus: kubevirtv1.DiskBusSATA}}})
+			spec.Volumes = append(spec.Volumes, kubevirtv1.Volume{Name: volumeDrivers,
+				VolumeSource: kubevirtv1.VolumeSource{ContainerDisk: &kubevirtv1.ContainerDiskSource{Image: r.driversImage}}})
+		}
+	}
+}
+
+func ptrUint32(v uint32) *uint32 { return &v }
+
+// hasInstallMedia says whether a machine still has its install CD-ROM attached.
+func hasInstallMedia(vm *kubevirtv1.VirtualMachine) bool {
+	if vm == nil || vm.Spec.Template == nil {
+		return false
+	}
+	for _, v := range vm.Spec.Template.Spec.Volumes {
+		if v.Name == volumeInstall {
+			return true
+		}
+	}
+	return false
 }

@@ -32,7 +32,23 @@ type Machine struct {
 	CPU       int
 	MemoryMiB int
 	DiskGiB   int
+	Media     string // the media it was made from, "" for a catalog image
+	Profile   string // the device profile it got from its media
 	CreatedAt time.Time
+}
+
+// Medium is a member's ISO or disk image (the data is a DataVolume named ID).
+type Medium struct {
+	ID           string
+	Owner        string
+	Name         string
+	Source       string // upload, url
+	URL          string
+	Kind         string // iso, disk
+	Profile      string // "" until the inspector ran
+	SizeBytes    int64
+	VirtualBytes int64
+	CreatedAt    time.Time
 }
 
 // Key is an SSH public key.
@@ -86,6 +102,12 @@ type Store interface {
 	Key(ctx context.Context, id string) (Key, error)
 	Keys(ctx context.Context, owner string) ([]Key, error)
 	DeleteKey(ctx context.Context, owner, id string) error
+	AddMedium(ctx context.Context, m Medium) error
+	Medium(ctx context.Context, id string) (Medium, error)
+	Media(ctx context.Context, owner string) ([]Medium, error)
+	// SetMediumProfile records what the inspector found.
+	SetMediumProfile(ctx context.Context, id, profile string, virtualBytes int64) error
+	DeleteMedium(ctx context.Context, id string) error
 }
 
 //go:embed migrations/*.sql
@@ -219,8 +241,8 @@ func (p *Postgres) CreateMachine(ctx context.Context, m Machine, check func(Usag
 		if err := check(u); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO machines (id, owner, name, image, size, cpu, memory_mib, disk_gib) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			m.ID, m.Owner, m.Name, m.Image, m.Size, m.CPU, m.MemoryMiB, m.DiskGiB)
+		_, err = tx.Exec(ctx, `INSERT INTO machines (id, owner, name, image, size, cpu, memory_mib, disk_gib, media, profile) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			m.ID, m.Owner, m.Name, m.Image, m.Size, m.CPU, m.MemoryMiB, m.DiskGiB, m.Media, m.Profile)
 		if isUniqueViolation(err) {
 			return ErrExists
 		}
@@ -228,11 +250,11 @@ func (p *Postgres) CreateMachine(ctx context.Context, m Machine, check func(Usag
 	})
 }
 
-const machineColumns = `id, owner, name, image, size, cpu, memory_mib, disk_gib, created_at`
+const machineColumns = `id, owner, name, image, size, cpu, memory_mib, disk_gib, media, profile, created_at`
 
 func scanMachine(row pgx.Row) (Machine, error) {
 	var m Machine
-	err := row.Scan(&m.ID, &m.Owner, &m.Name, &m.Image, &m.Size, &m.CPU, &m.MemoryMiB, &m.DiskGiB, &m.CreatedAt)
+	err := row.Scan(&m.ID, &m.Owner, &m.Name, &m.Image, &m.Size, &m.CPU, &m.MemoryMiB, &m.DiskGiB, &m.Media, &m.Profile, &m.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, ErrNotFound
 	}
@@ -313,5 +335,47 @@ func (p *Postgres) DeleteKey(ctx context.Context, owner, id string) error {
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
+	return err
+}
+
+const mediumColumns = `id, owner, name, source, url, kind, profile, size_bytes, virtual_bytes, created_at`
+
+func scanMedium(row pgx.Row) (Medium, error) {
+	var m Medium
+	err := row.Scan(&m.ID, &m.Owner, &m.Name, &m.Source, &m.URL, &m.Kind, &m.Profile, &m.SizeBytes, &m.VirtualBytes, &m.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return m, ErrNotFound
+	}
+	return m, err
+}
+
+func (p *Postgres) AddMedium(ctx context.Context, m Medium) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO media (id, owner, name, source, url, kind, profile, size_bytes, virtual_bytes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		m.ID, m.Owner, m.Name, m.Source, m.URL, m.Kind, m.Profile, m.SizeBytes, m.VirtualBytes)
+	if isUniqueViolation(err) {
+		return ErrExists
+	}
+	return err
+}
+
+func (p *Postgres) Medium(ctx context.Context, id string) (Medium, error) {
+	return scanMedium(p.pool.QueryRow(ctx, `SELECT `+mediumColumns+` FROM media WHERE id = $1`, id))
+}
+
+func (p *Postgres) Media(ctx context.Context, owner string) ([]Medium, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+mediumColumns+` FROM media WHERE owner = $1 ORDER BY created_at DESC`, owner)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Medium, error) { return scanMedium(r) })
+}
+
+func (p *Postgres) SetMediumProfile(ctx context.Context, id, profile string, virtualBytes int64) error {
+	_, err := p.pool.Exec(ctx, `UPDATE media SET profile = $2, virtual_bytes = greatest(virtual_bytes, $3) WHERE id = $1`, id, profile, virtualBytes)
+	return err
+}
+
+func (p *Postgres) DeleteMedium(ctx context.Context, id string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM media WHERE id = $1`, id)
 	return err
 }

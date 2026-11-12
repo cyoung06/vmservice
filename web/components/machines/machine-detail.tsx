@@ -17,6 +17,7 @@ import { Icon } from "@/components/ui/icon";
 import { post, remove } from "@/lib/api/http";
 import type { Machine } from "@/lib/api/types";
 import { formatCpu, formatMemory, formatTime } from "@/lib/formatting/format";
+import { profileLabel } from "@/lib/api/media";
 import { useAction } from "@/lib/hooks/use-action";
 import { sshCommand } from "@/lib/paths";
 import { classNames } from "@/lib/utilities/class-names";
@@ -79,9 +80,38 @@ const DeleteDialog = ({ machine, onClose }: { readonly machine: Machine; readonl
   );
 };
 
+const EjectDialog = ({ machine, onClose }: { readonly machine: Machine; readonly onClose: () => void }) => {
+  const action = useAction();
+  return (
+    <DialogFrame
+      title="Eject the install media?"
+      onClose={onClose}
+      submitLabel="Eject"
+      pending={action.pending}
+      error={action.error}
+      onSubmit={() =>
+        void action.run(() => post(`/api/vms/${encodeURIComponent(machine.id)}/eject`)).then((done) => {
+          if (done) {
+            onClose();
+          }
+        })
+      }
+    >
+      <p className="text-[13px] text-foreground-secondary">
+        The ISO{machine.profile === "windows" ? " and the driver CD are" : " is"} removed, so the machine boots from its
+        disk.{" "}
+        {machine.state === "Running" || machine.state === "Starting"
+          ? "The machine restarts now: finish or shut down the installer first."
+          : "It takes effect the next time the machine starts."}
+      </p>
+    </DialogFrame>
+  );
+};
+
 const Actions = ({ machine }: { readonly machine: Machine }) => {
   const action = useAction();
   const [deleting, setDeleting] = useState(false);
+  const [ejecting, setEjecting] = useState(false);
   const run = (verb: "start" | "stop" | "restart") =>
     void action.run(() => post(`/api/vms/${encodeURIComponent(machine.id)}/${verb}`));
   const { state } = machine;
@@ -103,6 +133,11 @@ const Actions = ({ machine }: { readonly machine: Machine }) => {
             Restart
           </Button>
         ) : null}
+        {machine.installMedia && state !== "Deleting" ? (
+          <Button onClick={() => setEjecting(true)} leadingIcon={<Icon name="arrow-up" size={12} />}>
+            Eject install media
+          </Button>
+        ) : null}
         <Button
           variant="ghost"
           disabled={state === "Deleting"}
@@ -115,6 +150,7 @@ const Actions = ({ machine }: { readonly machine: Machine }) => {
       </div>
       <ErrorText message={action.error} />
       {deleting ? <DeleteDialog machine={machine} onClose={() => setDeleting(false)} /> : null}
+      {ejecting ? <EjectDialog machine={machine} onClose={() => setEjecting(false)} /> : null}
     </div>
   );
 };
@@ -131,25 +167,65 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
     (mine ?? []).filter((other) => other.name.toLowerCase() === machine.name.toLowerCase()).length === 1
       ? machine.name
       : null;
+  const windows = machine.profile === "windows";
   return (
     <div className="scrollbar-thin min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto flex max-w-[1080px] flex-col gap-8 px-4 py-5 md:px-8 md:py-6">
+        {windows && machine.installMedia ? (
+          <Section title="Installing Windows">
+            <ol className="flex list-decimal flex-col gap-1.5 pl-5 text-xs text-foreground-tertiary">
+              <li>Open the Console tab and choose VNC; Windows Setup starts from the ISO.</li>
+              <li>
+                At &ldquo;Where do you want to install Windows?&rdquo; no disk is listed yet: choose{" "}
+                <span className="text-foreground-secondary">Load driver</span>, browse to the virtio CD and pick{" "}
+                <span className="font-mono text-foreground-secondary">viostor</span> (for your Windows version, amd64).
+                The disk appears.
+              </li>
+              <li>Finish Setup; it sets the account and password. Install the network driver from the same CD afterwards.</li>
+              <li>
+                Then <span className="text-foreground-secondary">Eject install media</span> (above), so the machine boots
+                from its disk.
+              </li>
+            </ol>
+          </Section>
+        ) : null}
         <Section title="Details">
           <Details
             items={[
-              ["Image", machine.imageName],
+              [machine.media ? "Media" : "Image", machine.imageName || machine.media || "—"],
+              ...(machine.profile ? ([["OS profile", profileLabel(machine.profile)]] as [string, React.ReactNode][]) : []),
               ["Size", `${formatCpu(machine.cpu)} · ${formatMemory(machine.memoryMiB)}`],
               ["Disk", `${machine.diskGiB} GiB`],
-              ["User", <span key="user" className="font-mono text-xs">{machine.defaultUser}</span>],
+              ...(machine.defaultUser
+                ? ([["User", <span key="user" className="font-mono text-xs">{machine.defaultUser}</span>]] as [string, React.ReactNode][])
+                : []),
               ["Created", formatTime(machine.createdAt)],
               ["ID", <span key="id" className="font-mono text-xs">{machine.id}</span>],
             ]}
           />
         </Section>
         <Section title="Connect">
+          {windows ? (
+            <div className="flex flex-col gap-3 text-xs text-foreground-tertiary">
+              <p>Sign in at the VNC console with the account you made during Windows Setup.</p>
+              {configuration.ssh ? (
+                <div className="flex flex-col gap-1.5">
+                  <p>
+                    For Remote Desktop: enable <span className="text-foreground-secondary">OpenSSH Server</span> in
+                    Windows (Settings → System → Optional features), then tunnel RDP through the jump host and connect
+                    your RDP client to <span className="font-mono text-foreground-secondary">localhost</span>:
+                  </p>
+                  <CopyLine
+                    text={`${sshCommand(configuration.ssh, "<windows user>", sshName ?? machine.id)} -L 3389:localhost:3389`}
+                  />
+                </div>
+              ) : null}
+            </div>
+          ) : (
           <div className="flex flex-col gap-3 text-xs text-foreground-tertiary">
             <p>
-              On the console, sign in as <span className="font-mono text-foreground-secondary">{machine.defaultUser}</span>{" "}
+              On the console, sign in as{" "}
+              <span className="font-mono text-foreground-secondary">{machine.defaultUser || "the image's default user"}</span>{" "}
               with the password you set when you made the machine, if you set one.
             </p>
             {configuration.ssh ? (
@@ -161,11 +237,12 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
                   </Link>{" "}
                   before the machine was made:
                 </p>
-                <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser, machine.id)} />
-                {sshName ? <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser, sshName)} /> : null}
+                <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser || "<user>", machine.id)} />
+                {sshName ? <CopyLine text={sshCommand(configuration.ssh, machine.defaultUser || "<user>", sshName)} /> : null}
               </div>
             ) : null}
           </div>
+          )}
         </Section>
       </div>
     </div>

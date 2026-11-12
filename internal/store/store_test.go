@@ -25,7 +25,7 @@ func stores(t *testing.T) map[string]Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS ssh_keys, machines, members, schema_migrations`); err != nil {
+	if _, err := conn.Exec(ctx, `DROP TABLE IF EXISTS media, ssh_keys, machines, members, schema_migrations`); err != nil {
 		t.Fatal(err)
 	}
 	conn.Close(ctx)
@@ -190,5 +190,41 @@ func TestReadOnlyRole(t *testing.T) {
 	}
 	if err := ro.DeleteKey(ctx, "alice", "k1"); err == nil {
 		t.Error("the bastion's role could delete a key")
+	}
+}
+
+func TestMedia(t *testing.T) {
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s.UpsertMember(ctx, "alice", "alice")
+			s.UpsertMember(ctx, "bob", "bob")
+			m := Medium{ID: "md-aaaaaa", Owner: "alice", Name: "Win 11", Source: "upload", Kind: "iso", SizeBytes: 6 << 30, VirtualBytes: 6 << 30}
+			if err := s.AddMedium(ctx, m); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.AddMedium(ctx, m); !errors.Is(err, ErrExists) {
+				t.Errorf("again = %v", err)
+			}
+			s.SetMediumProfile(ctx, "md-aaaaaa", "windows", 1)
+			got, err := s.Medium(ctx, "md-aaaaaa")
+			if err != nil || got.Profile != "windows" || got.VirtualBytes != 6<<30 || got.Owner != "alice" {
+				t.Errorf("medium = %+v, %v", got, err)
+			}
+			if list, _ := s.Media(ctx, "bob"); len(list) != 0 {
+				t.Errorf("bob sees %v", list)
+			}
+			mm := Machine{ID: "vm-mmmmmm", Owner: "alice", Name: "w", Media: "md-aaaaaa", Profile: "windows"}
+			if err := s.CreateMachine(ctx, mm, func(Usage) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := s.Machine(ctx, "vm-mmmmmm"); got.Media != "md-aaaaaa" || got.Profile != "windows" {
+				t.Errorf("machine media = %+v", got)
+			}
+			s.DeleteMedium(ctx, "md-aaaaaa")
+			if _, err := s.Medium(ctx, "md-aaaaaa"); !errors.Is(err, ErrNotFound) {
+				t.Errorf("after delete = %v", err)
+			}
+		})
 	}
 }

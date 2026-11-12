@@ -36,6 +36,7 @@ func TestPages(t *testing.T) {
 		{"/%2Fevil.com%2F..%2Fmachine?id=vm-a", "", 301},
 		{"/%2Fmachine?id=vm-a", "", 301},
 		{"/config.json", `"title":"VMService"`, 200},
+		{"/favicon.svg", "<svg", 200},
 		{"/.hidden", "missing", 404},
 		{"/nope", "missing", 404},
 	} {

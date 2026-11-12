@@ -17,17 +17,21 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 	toolscache "k8s.io/client-go/tools/cache"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
+	uploadv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/upload/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -61,25 +65,30 @@ type Service struct {
 	read      client.Reader // the informer cache
 	write     client.Client // straight to the API server
 	store     store.Store
+	watch     client.WithWatch // for waiting on one object (an upload becoming ready, a probe Job)
 	http      *http.Client
-	hub       *hub
-	log       *slog.Logger
+	// MediaConfig is set by the caller before members add media.
+	MediaConfig MediaConfig
+	hub         *hub
+	log         *slog.Logger
 }
 
 // New connects to the cluster and starts the cache of the namespace's VirtualMachines and
 // DataVolumes. It returns once the cache has synced.
 func New(ctx context.Context, cfg *rest.Config, namespace string, catalog *config.Catalog, st store.Store, log *slog.Logger) (*Service, error) {
 	scheme := runtime.NewScheme()
-	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, kubevirtv1.AddToScheme, cdiv1.AddToScheme} {
+	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, batchv1.AddToScheme, kubevirtv1.AddToScheme, cdiv1.AddToScheme, uploadv1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			return nil, err
 		}
 	}
-	c, err := cache.New(cfg, cache.Options{Scheme: scheme, DefaultNamespaces: map[string]cache.Config{namespace: {}}})
+	// Jobs: only the inspector's.
+	c, err := cache.New(cfg, cache.Options{Scheme: scheme, DefaultNamespaces: map[string]cache.Config{namespace: {}},
+		ByObject: map[client.Object]cache.ByObject{&batchv1.Job{}: {Label: labels.SelectorFromSet(labels.Set{LabelJob: "inspect"})}}})
 	if err != nil {
 		return nil, err
 	}
-	write, err := client.New(cfg, client.Options{Scheme: scheme})
+	write, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +96,7 @@ func New(ctx context.Context, cfg *rest.Config, namespace string, catalog *confi
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{Namespace: namespace, Catalog: catalog, Config: cfg, read: c, write: write, store: st, http: httpClient, log: log}
+	s := &Service{Namespace: namespace, Catalog: catalog, Config: cfg, read: c, write: write, watch: write, store: st, http: httpClient, log: log}
 	s.hub = newHub(ctx, s.render)
 
 	vms, err := c.GetInformer(ctx, &kubevirtv1.VirtualMachine{})
@@ -105,10 +114,20 @@ func New(ctx context.Context, cfg *rest.Config, namespace string, catalog *confi
 	if err != nil {
 		return nil, err
 	}
-	// A disk's clone progress is part of its machine's state.
+	// A disk's clone progress is part of its machine's state; a medium's import is the medium's.
 	if _, err := disks.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
 		AddFunc:    func(o any) { s.diskChanged(o) },
 		UpdateFunc: func(_, o any) { s.diskChanged(o) },
+	}); err != nil {
+		return nil, err
+	}
+	jobs, err := c.GetInformer(ctx, &batchv1.Job{})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := jobs.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		AddFunc:    func(o any) { s.jobChanged(o) },
+		UpdateFunc: func(_, o any) { s.jobChanged(o) },
 	}); err != nil {
 		return nil, err
 	}
@@ -175,8 +194,22 @@ func (s *Service) vmGone(o any) {
 }
 
 func (s *Service) diskChanged(o any) {
-	if dv, ok := o.(*cdiv1.DataVolume); ok && dv.Labels[LabelOwner] != "" && dv.Labels[LabelMachine] != "" {
+	dv, ok := o.(*cdiv1.DataVolume)
+	if !ok || dv.Labels[LabelOwner] == "" {
+		return
+	}
+	switch {
+	case dv.Labels[LabelMachine] != "":
 		s.hub.publish(change{owner: dv.Labels[LabelOwner], id: dv.Labels[LabelMachine]})
+	case dv.Labels[LabelMedium] != "":
+		s.hub.publish(change{owner: dv.Labels[LabelOwner], id: dv.Labels[LabelMedium], medium: true})
+		go s.ensureInspected(dv.DeepCopy()) // off the informer's goroutine
+	}
+}
+
+func (s *Service) jobChanged(o any) {
+	if j, ok := o.(*batchv1.Job); ok && jobFinished(j) {
+		go s.inspected(j.DeepCopy())
 	}
 }
 
@@ -185,6 +218,13 @@ func (s *Service) diskChanged(o any) {
 func (s *Service) render(c change) Event {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if c.medium {
+		row, err := s.store.Medium(ctx, c.id)
+		if err != nil || row.Owner != c.owner {
+			return Event{Kind: "medium-deleted", Data: map[string]string{"id": c.id}}
+		}
+		return Event{Kind: "medium", Data: s.toMedium(ctx, row, time.Now())}
+	}
 	row, err := s.store.Machine(ctx, c.id)
 	if err != nil || row.Owner != c.owner {
 		return Event{Kind: "deleted", Data: map[string]string{"id": c.id}}
@@ -275,7 +315,28 @@ func (s *Service) Create(ctx context.Context, owner string, r Request) (Machine,
 	if err != nil {
 		return Machine{}, s.storeError("reading your SSH keys", err)
 	}
-	if len(keys) == 0 && r.PasswordHash == "" {
+	if r.MediaID != "" {
+		ref, err := s.resolveMedium(ctx, owner, r.MediaID)
+		if err != nil {
+			return Machine{}, err
+		}
+		r.media, r.profile, r.driversImage = &ref, ref.Profile, s.MediaConfig.DriversImage
+		if p := r.ProfileOverride; p != "" {
+			if p != "windows" && p != "linux" && p != "uefi" && p != "bios" {
+				return Machine{}, refuse(http.StatusBadRequest, "There is no profile %q.", p)
+			}
+			r.profile = p
+		}
+		if need := (ref.PVCBytes + (1<<30 - 1)) >> 30; int64(r.DiskGiB) < need {
+			return Machine{}, refuse(http.StatusBadRequest, "The disk must be at least %d GiB for this medium.", need)
+		}
+		// No password from here: an installer sets one (ISO); a disk image's default user is the
+		// image's own, reached with the member's SSH keys.
+		r.PasswordHash = ""
+		if ref.Kind == "disk" && len(keys) == 0 {
+			return Machine{}, refuse(http.StatusBadRequest, "Add an SSH key first: it's how you sign in to a machine made from a disk image.")
+		}
+	} else if len(keys) == 0 && r.PasswordHash == "" {
 		return Machine{}, refuse(http.StatusBadRequest, "Set a password or add an SSH key first: otherwise nothing can sign in to the machine.")
 	}
 	for _, k := range keys {
@@ -283,7 +344,10 @@ func (s *Service) Create(ctx context.Context, owner string, r Request) (Machine,
 	}
 	var row store.Machine
 	for attempt := 0; ; attempt++ {
-		row = store.Machine{ID: newID(), Owner: owner, Name: r.Name, Image: r.Image.ID, Size: r.Size.ID, CPU: r.Size.CPU, MemoryMiB: r.Size.MemoryMiB, DiskGiB: r.DiskGiB}
+		row = store.Machine{ID: newID(), Owner: owner, Name: r.Name, Image: r.Image.ID, Size: r.Size.ID, CPU: r.Size.CPU, MemoryMiB: r.Size.MemoryMiB, DiskGiB: r.DiskGiB, Profile: r.profile}
+		if r.media != nil {
+			row.Media = r.media.ID
+		}
 		err := s.store.CreateMachine(ctx, row, check)
 		var le *store.LimitError
 		switch {
@@ -330,6 +394,49 @@ func (s *Service) Create(ctx context.Context, owner string, r Request) (Machine,
 	}
 	s.log.Info("machine created", "owner", owner, "id", vm.Name, "image", r.Image.ID, "size", r.Size.ID, "diskGiB", r.DiskGiB)
 	return toMachine(row, vm, nil, s.Catalog, time.Now()), nil
+}
+
+// Eject removes a machine's install CD-ROMs (the ISO and the driver CD) so it boots from its disk,
+// and restarts it if it's running. The ISO's per-machine copy is deleted with them.
+func (s *Service) Eject(ctx context.Context, owner, id string) error {
+	if _, _, err := s.get(ctx, owner, id); err != nil {
+		return err
+	}
+	running := false
+	for attempt := 0; ; attempt++ {
+		var vm kubevirtv1.VirtualMachine // fresh from the API server: the update is conditional on it
+		if err := s.write.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: id}, &vm); err != nil {
+			return s.kubeError("reading the machine", err)
+		}
+		if !hasInstallMedia(&vm) {
+			return refuse(http.StatusConflict, "The machine has no install media attached.")
+		}
+		running = vm.Status.PrintableStatus == kubevirtv1.VirtualMachineStatusRunning
+		spec := &vm.Spec.Template.Spec
+		cd := func(name string) bool { return name == volumeInstall || name == volumeDrivers }
+		spec.Domain.Devices.Disks = slices.DeleteFunc(spec.Domain.Devices.Disks, func(d kubevirtv1.Disk) bool { return cd(d.Name) })
+		spec.Volumes = slices.DeleteFunc(spec.Volumes, func(v kubevirtv1.Volume) bool { return cd(v.Name) })
+		vm.Spec.DataVolumeTemplates = slices.DeleteFunc(vm.Spec.DataVolumeTemplates, func(t kubevirtv1.DataVolumeTemplateSpec) bool { return t.Name == installName(id) })
+		for i := range spec.Domain.Devices.Disks {
+			spec.Domain.Devices.Disks[i].BootOrder = nil
+		}
+		err := s.write.Update(ctx, &vm)
+		if err == nil {
+			break
+		}
+		if !apierrors.IsConflict(err) || attempt == 3 {
+			return s.kubeError("ejecting the install media", err)
+		}
+	}
+	install := &cdiv1.DataVolume{ObjectMeta: metav1.ObjectMeta{Name: installName(id), Namespace: s.Namespace}}
+	if err := s.write.Delete(ctx, install, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		s.log.Warn("deleting an ejected ISO copy", "id", id, "err", err)
+	}
+	s.log.Info("install media ejected", "owner", owner, "id", id)
+	if running {
+		return s.subresource(ctx, id, "restart")
+	}
+	return nil
 }
 
 // Action is start, stop or restart.
