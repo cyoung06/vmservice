@@ -122,6 +122,8 @@ type Store interface {
 	// MachineByName is the machine named name (names are unique across everyone).
 	MachineByName(ctx context.Context, name string) (Machine, error)
 	AllMachines(ctx context.Context) ([]Machine, error)
+	// MachinesFrom is the machines made from the image media.
+	MachinesFrom(ctx context.Context, media string) ([]Machine, error)
 	Member(ctx context.Context, owner string) (Member, error)
 	Members(ctx context.Context) ([]Member, error)
 	SetUID(ctx context.Context, owner string, uid *int) error
@@ -320,6 +322,10 @@ func (p *Postgres) machines(ctx context.Context, sql string, args ...any) ([]Mac
 
 func (p *Postgres) MachineByName(ctx context.Context, name string) (Machine, error) {
 	return scanMachine(p.pool.QueryRow(ctx, machineSelect+`WHERE m.name = $1`, name))
+}
+
+func (p *Postgres) MachinesFrom(ctx context.Context, media string) ([]Machine, error) {
+	return p.machines(ctx, machineSelect+`WHERE m.media = $1 ORDER BY m.created_at DESC`, media)
 }
 
 func (p *Postgres) AllMachines(ctx context.Context) ([]Machine, error) {

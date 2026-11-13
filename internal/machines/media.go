@@ -428,6 +428,35 @@ func (s *Service) DeleteMedium(ctx context.Context, a Actor, id string) error {
 	if err != nil {
 		return err
 	}
+	// Machines' disks are ZFS clones of the image: it can't go while any depends on it. A disk
+	// image's machines always do; an ISO's only until they eject it (their install copy is the clone).
+	users, err := s.store.MachinesFrom(ctx, id)
+	if err != nil {
+		return s.storeError("checking which machines use the image", err)
+	}
+	var mine []string
+	blocking := 0
+	for _, m := range users {
+		if row.Kind == "iso" && s.dataVolume(ctx, installName(m.ID)) == nil {
+			continue // ejected: nothing of the ISO left in it
+		}
+		blocking++
+		if a.may(m.Owner) {
+			mine = append(mine, m.Name)
+		}
+	}
+	if blocking > 0 {
+		msg := fmt.Sprintf("%d machine(s) still use this image", blocking)
+		if len(mine) > 0 {
+			msg += " (" + strings.Join(mine, ", ") + ")"
+		}
+		if row.Kind == "iso" {
+			msg += "; eject it from them or delete them first."
+		} else {
+			msg += "; their disks are copies of it that share its data, so delete them first."
+		}
+		return refuse(http.StatusConflict, "%s", msg)
+	}
 	dv := &cdiv1.DataVolume{ObjectMeta: metav1.ObjectMeta{Name: id, Namespace: s.Namespace}}
 	if err := s.write.Delete(ctx, dv, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 		return s.kubeError("deleting the medium", err)

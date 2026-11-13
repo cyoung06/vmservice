@@ -354,3 +354,14 @@ func (m *Memory) UpdateMedium(_ context.Context, id string, u MediumUpdate) erro
 	m.media[id] = x
 	return nil
 }
+
+func (m *Memory) MachinesFrom(ctx context.Context, media string) ([]Machine, error) {
+	all, _ := m.AllMachines(ctx)
+	var out []Machine
+	for _, x := range all {
+		if x.Media == media {
+			out = append(out, x)
+		}
+	}
+	return out, nil
+}

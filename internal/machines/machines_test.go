@@ -250,11 +250,12 @@ func TestImageVisibilityAndAdmin(t *testing.T) {
 	if all, _ := s.AllMachines(ctx, admin); len(all) != 1 {
 		t.Errorf("admin AllMachines = %v", all)
 	}
-	if err := s.DeleteMedium(ctx, admin, img); err != nil {
-		t.Errorf("admin deleting an image = %v", err)
-	}
 	if err := s.Delete(ctx, admin, m.ID); err != nil {
 		t.Errorf("admin deleting a machine = %v", err)
+	}
+	s.store.DeleteMachine(ctx, m.ID) // what the VM watch does once the VM is gone
+	if err := s.DeleteMedium(ctx, admin, img); err != nil {
+		t.Errorf("admin deleting an image = %v", err)
 	}
 }
 
@@ -472,5 +473,39 @@ func TestLookupByName(t *testing.T) {
 		if got != want {
 			t.Errorf("Address(%q) = %v, want %d (409: found but not running)", host, err, want)
 		}
+	}
+}
+
+// Machines' disks are clones of their image: an image in use can't be deleted (an ISO is freed by Eject).
+func TestImageInUseCantBeDeleted(t *testing.T) {
+	s, _ := testService(t)
+	ctx := context.Background()
+	disk := readyImage(t, s, alice, qcowHeader(5), 700<<20, "bios")
+	m, err := s.Create(ctx, alice, request("user1", disk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteMedium(ctx, alice, disk); status(err) != http.StatusConflict || !strings.Contains(err.Error(), "user1") {
+		t.Errorf("deleting a disk image in use = %v, want 409 naming user1", err)
+	}
+	s.store.DeleteMachine(ctx, m.ID)
+	if err := s.DeleteMedium(ctx, alice, disk); err != nil {
+		t.Errorf("deleting an unused disk image = %v", err)
+	}
+	iso := readyImage(t, s, alice, isoHeader(), 2<<30, "linux")
+	m, err = s.Create(ctx, alice, request("installer", iso))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the VM's install DataVolume, as KubeVirt would create it from the template
+	s.write.Create(ctx, &cdiv1.DataVolume{ObjectMeta: metav1.ObjectMeta{Name: installName(m.ID), Namespace: "cloud"}})
+	if err := s.DeleteMedium(ctx, alice, iso); status(err) != http.StatusConflict {
+		t.Errorf("deleting an ISO still attached = %v, want 409", err)
+	}
+	if err := s.Eject(ctx, alice, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteMedium(ctx, alice, iso); err != nil {
+		t.Errorf("deleting an ISO after eject = %v", err)
 	}
 }
