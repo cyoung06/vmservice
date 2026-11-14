@@ -313,8 +313,11 @@ func applyMedia(vm *kubevirtv1.VirtualMachine, id string, storage *cdiv1.Storage
 		one, two := uint(1), uint(2)
 		spec.Domain.Devices.Disks[0].BootOrder = &two
 		spec.Domain.Devices.Disks = append(spec.Domain.Devices.Disks, kubevirtv1.Disk{
+			// virtio-scsi: the firmware reads it fast (an emulated SATA CD took minutes to load Windows'
+			// boot.wim). Windows Setup then needs vioscsi from the driver CD, which stays on SATA so
+			// Setup can read it without any driver.
 			Name: volumeInstall, BootOrder: &one,
-			DiskDevice: kubevirtv1.DiskDevice{CDRom: &kubevirtv1.CDRomTarget{Bus: kubevirtv1.DiskBusSATA}},
+			DiskDevice: kubevirtv1.DiskDevice{CDRom: &kubevirtv1.CDRomTarget{Bus: kubevirtv1.DiskBusSCSI}},
 		})
 		spec.Volumes = append(spec.Volumes, kubevirtv1.Volume{Name: volumeInstall,
 			VolumeSource: kubevirtv1.VolumeSource{DataVolume: &kubevirtv1.DataVolumeSource{Name: installName(id)}}})

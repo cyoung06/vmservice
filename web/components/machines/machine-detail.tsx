@@ -174,12 +174,20 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
         {windows && machine.installMedia ? (
           <Section title="Installing Windows">
             <ol className="flex list-decimal flex-col gap-1.5 pl-5 text-xs text-foreground-tertiary">
-              <li>Open the Console tab and choose VNC; Windows Setup starts from the ISO.</li>
               <li>
-                At &ldquo;Where do you want to install Windows?&rdquo; no disk is listed yet: choose{" "}
+                Open the Console tab with VNC <em>before</em> the machine starts (or restart it with VNC open), and press a
+                key when it says &ldquo;Press any key to boot from CD or DVD&rdquo;. Otherwise it falls back to the
+                firmware menu.
+              </li>
+              <li>
+                If Setup says a media driver is missing: choose{" "}
                 <span className="text-foreground-secondary">Load driver</span>, browse to the virtio CD and pick{" "}
-                <span className="font-mono text-foreground-secondary">viostor</span> (for your Windows version, amd64).
-                The disk appears.
+                <span className="font-mono text-foreground-secondary">vioscsi</span> (for your Windows version, amd64).
+              </li>
+              <li>
+                At &ldquo;Where do you want to install Windows?&rdquo; no disk is listed yet:{" "}
+                <span className="text-foreground-secondary">Load driver</span> again and pick{" "}
+                <span className="font-mono text-foreground-secondary">viostor</span>. The disk appears.
               </li>
               <li>Finish Setup; it sets the account and password. Install the network driver from the same CD afterwards.</li>
               <li>
