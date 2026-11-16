@@ -180,14 +180,10 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
                 firmware menu.
               </li>
               <li>
-                If Setup says a media driver is missing: choose{" "}
+                When Setup says a media driver is missing, or lists no disk: choose{" "}
                 <span className="text-foreground-secondary">Load driver</span>, browse to the virtio CD and pick{" "}
                 <span className="font-mono text-foreground-secondary">vioscsi</span> (for your Windows version, amd64).
-              </li>
-              <li>
-                At &ldquo;Where do you want to install Windows?&rdquo; no disk is listed yet:{" "}
-                <span className="text-foreground-secondary">Load driver</span> again and pick{" "}
-                <span className="font-mono text-foreground-secondary">viostor</span>. The disk appears.
+                That one driver serves both the install CD and the disk; load nothing else.
               </li>
               <li>Finish Setup; it sets the account and password. Install the network driver from the same CD afterwards.</li>
               <li>

@@ -171,6 +171,11 @@ func TestCreateFromPresetGivesTheMembersAccount(t *testing.T) {
 	if src := vm.Spec.DataVolumeTemplates[0].Spec.Source.PVC; src == nil || src.Name != img {
 		t.Errorf("root source = %+v", vm.Spec.DataVolumeTemplates[0].Spec.Source)
 	}
+	for _, d := range vm.Spec.Template.Spec.Domain.Devices.Disks {
+		if d.Disk == nil || d.Disk.Bus != kubevirtv1.DiskBusSCSI {
+			t.Errorf("disk %s = %+v, want virtio-scsi", d.Name, d.DiskDevice)
+		}
+	}
 	doc, err := s.secretUserData(ctx, m.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -337,6 +342,23 @@ func TestPasswordAndWindows(t *testing.T) {
 	spec := vm.Spec.Template.Spec
 	if spec.Domain.Devices.TPM == nil || !*spec.Domain.Firmware.Bootloader.EFI.SecureBoot || spec.Domain.Features.SMM == nil || !hasVolume(&vm, volumeDrivers) {
 		t.Error("a Windows machine lacks TPM, Secure Boot, SMM or the driver CD")
+	}
+	// Only the driver CD is off virtio-scsi: Setup must read it before any driver is loaded, and
+	// vioscsi alone then serves the install CD and the disk.
+	for _, d := range spec.Domain.Devices.Disks {
+		bus := kubevirtv1.DiskBus("")
+		if d.Disk != nil {
+			bus = d.Disk.Bus
+		} else if d.CDRom != nil {
+			bus = d.CDRom.Bus
+		}
+		want := kubevirtv1.DiskBusSCSI
+		if d.Name == volumeDrivers {
+			want = kubevirtv1.DiskBusSATA
+		}
+		if bus != want {
+			t.Errorf("disk %s on %q, want %q", d.Name, bus, want)
+		}
 	}
 	if err := s.Eject(ctx, alice, m.ID); err != nil {
 		t.Fatal(err)

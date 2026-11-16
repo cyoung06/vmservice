@@ -144,8 +144,11 @@ func buildVM(namespace, id, owner, storageClass string, r Request) *kubevirtv1.V
 						},
 						Devices: kubevirtv1.Devices{
 							Disks: []kubevirtv1.Disk{
-								{Name: "root", DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: kubevirtv1.DiskBusVirtio}}},
-								{Name: "cloudinit", DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: kubevirtv1.DiskBusVirtio}}},
+								// Everything on virtio-scsi: one controller, TRIM back to the pool, and Windows needs
+								// just one driver (vioscsi). 24H2 Setup carries only the last "Load driver" package into
+								// the new OS, so a virtio-blk disk (viostor) plus a virtio-scsi CD left it unbootable.
+								{Name: "root", DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: kubevirtv1.DiskBusSCSI}}},
+								{Name: "cloudinit", DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: kubevirtv1.DiskBusSCSI}}},
 							},
 							Interfaces: []kubevirtv1.Interface{{
 								Name:                   "default",
@@ -315,7 +318,7 @@ func applyMedia(vm *kubevirtv1.VirtualMachine, id string, storage *cdiv1.Storage
 		spec.Domain.Devices.Disks = append(spec.Domain.Devices.Disks, kubevirtv1.Disk{
 			// virtio-scsi: the firmware reads it fast (an emulated SATA CD took minutes to load Windows'
 			// boot.wim). Windows Setup then needs vioscsi from the driver CD, which stays on SATA so
-			// Setup can read it without any driver.
+			// Setup can read it without any driver; vioscsi also serves the root disk.
 			Name: volumeInstall, BootOrder: &one,
 			DiskDevice: kubevirtv1.DiskDevice{CDRom: &kubevirtv1.CDRomTarget{Bus: kubevirtv1.DiskBusSCSI}},
 		})
