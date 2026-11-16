@@ -185,7 +185,17 @@ const Overview = ({ machine }: { readonly machine: Machine }) => {
                 <span className="font-mono text-foreground-secondary">vioscsi</span> (for your Windows version, amd64).
                 That one driver serves both the install CD and the disk; load nothing else.
               </li>
-              <li>Finish Setup; it sets the account and password. Install the network driver from the same CD afterwards.</li>
+              <li>
+                At &ldquo;Let&rsquo;s connect you to a network&rdquo;, choose{" "}
+                <span className="text-foreground-secondary">Install drivers</span> and pick{" "}
+                <span className="font-mono text-foreground-secondary">NetKVM</span> (for your Windows version, amd64) on
+                the virtio CD.
+              </li>
+              <li>Finish Setup; it sets the account and password.</li>
+              <li>
+                On the desktop, run <span className="font-mono text-foreground-secondary">virtio-win-guest-tools.exe</span>{" "}
+                from the virtio CD for the remaining drivers and the guest agent.
+              </li>
               <li>
                 Then <span className="text-foreground-secondary">Eject install media</span> (above), so the machine boots
                 from its disk.
