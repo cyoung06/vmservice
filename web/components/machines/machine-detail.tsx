@@ -102,7 +102,7 @@ const EjectDialog = ({ machine, onClose }: { readonly machine: Machine; readonly
         The ISO{machine.profile === "windows" ? " and the driver CD are" : " is"} removed, so the machine boots from its
         disk.{" "}
         {machine.state === "Running" || machine.state === "Starting"
-          ? "The machine restarts now: finish or shut down the installer first."
+          ? "The machine keeps running; the CDs go the next time you Restart or Stop and Start it here (a restart inside the machine doesn't count)."
           : "It takes effect the next time the machine starts."}
       </p>
     </DialogFrame>

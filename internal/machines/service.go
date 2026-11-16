@@ -498,13 +498,14 @@ func hasVolume(vm *kubevirtv1.VirtualMachine, name string) bool {
 	return false
 }
 
-// Eject removes a machine's install CD-ROMs (the ISO and the driver CD) so it boots from its disk,
-// and restarts it if it's running. The ISO's per-machine copy is deleted with them.
+// Eject removes a machine's install CD-ROMs (the ISO and the driver CD) from its spec so it boots
+// from its disk. A running machine is left alone: the CDs go when it next starts (Restart or
+// Stop/Start here, not a reboot inside the guest). The ISO's per-machine copy is deleted with them;
+// PVC protection keeps it until the running machine lets go of it.
 func (s *Service) Eject(ctx context.Context, a Actor, id string) error {
 	if _, _, err := s.get(ctx, a, id); err != nil {
 		return err
 	}
-	running := false
 	for attempt := 0; ; attempt++ {
 		var vm kubevirtv1.VirtualMachine // fresh from the API server: the update is conditional on it
 		if err := s.write.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: id}, &vm); err != nil {
@@ -513,7 +514,6 @@ func (s *Service) Eject(ctx context.Context, a Actor, id string) error {
 		if !hasInstallMedia(&vm) {
 			return refuse(http.StatusConflict, "The machine has no install media attached.")
 		}
-		running = vm.Status.PrintableStatus == kubevirtv1.VirtualMachineStatusRunning
 		spec := &vm.Spec.Template.Spec
 		cd := func(name string) bool { return name == volumeInstall || name == volumeDrivers }
 		spec.Domain.Devices.Disks = slices.DeleteFunc(spec.Domain.Devices.Disks, func(d kubevirtv1.Disk) bool { return cd(d.Name) })
@@ -535,9 +535,6 @@ func (s *Service) Eject(ctx context.Context, a Actor, id string) error {
 		s.log.Warn("deleting an ejected ISO copy", "id", id, "err", err)
 	}
 	s.log.Info("install media ejected", "by", a.Username, "id", id)
-	if running {
-		return s.subresource(ctx, id, "restart")
-	}
 	return nil
 }
 
