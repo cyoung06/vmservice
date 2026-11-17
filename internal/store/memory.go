@@ -77,6 +77,23 @@ func (m *Memory) usage(owner string) Usage {
 	return u
 }
 
+func (m *Memory) ResizeMachine(_ context.Context, id, size string, cpu, memoryMiB int, check func(Usage, Quota) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	x, ok := m.machines[id]
+	if !ok {
+		return ErrNotFound
+	}
+	u := m.usage(x.Owner)
+	u.VMs, u.CPU, u.MemoryMiB, u.DiskGiB = u.VMs-1, u.CPU-x.CPU, u.MemoryMiB-x.MemoryMiB, u.DiskGiB-x.DiskGiB
+	if err := check(u, m.quotas[x.Owner]); err != nil {
+		return err
+	}
+	x.Size, x.CPU, x.MemoryMiB = size, cpu, memoryMiB
+	m.machines[id] = x
+	return nil
+}
+
 func (m *Memory) CreateMachine(_ context.Context, x Machine, check func(Usage, Quota) error) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -19,12 +19,14 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -413,23 +415,7 @@ func (s *Service) Create(ctx context.Context, a Actor, r Request) (Machine, erro
 		}
 		r.OwnerName, r.UID = a.Username, member.UID
 	}
-	check := func(u store.Usage, q store.Quota) error {
-		if a.Admin {
-			return nil
-		}
-		l := s.limits(q)
-		switch {
-		case u.VMs+1 > *l.VMs:
-			return &store.LimitError{Message: fmt.Sprintf("You already have %d of %d machines.", u.VMs, *l.VMs)}
-		case u.CPU+r.Size.CPU > *l.CPU:
-			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d vCPUs.", u.CPU+r.Size.CPU, *l.CPU)}
-		case u.MemoryMiB+r.Size.MemoryMiB > *l.MemoryMiB:
-			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d MiB of memory.", u.MemoryMiB+r.Size.MemoryMiB, *l.MemoryMiB)}
-		case u.DiskGiB+r.DiskGiB > *l.DiskGiB:
-			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d GiB of disk.", u.DiskGiB+r.DiskGiB, *l.DiskGiB)}
-		}
-		return nil
-	}
+	check := s.within(a, store.Usage{VMs: 1, CPU: r.Size.CPU, MemoryMiB: r.Size.MemoryMiB, DiskGiB: r.DiskGiB})
 	var row store.Machine
 	for attempt := 0; ; attempt++ {
 		row = store.Machine{ID: newID(), Owner: a.Owner, Name: r.Name, Image: ref.Name, Size: r.Size.ID, CPU: r.Size.CPU, MemoryMiB: r.Size.MemoryMiB, DiskGiB: r.DiskGiB, Media: ref.ID, Profile: r.profile}
@@ -496,6 +482,71 @@ func hasVolume(vm *kubevirtv1.VirtualMachine, name string) bool {
 		}
 	}
 	return false
+}
+
+// within checks that an owner's machines (u) plus add stay within their limits; admins have none.
+func (s *Service) within(a Actor, add store.Usage) func(store.Usage, store.Quota) error {
+	return func(u store.Usage, q store.Quota) error {
+		if a.Admin {
+			return nil
+		}
+		l := s.limits(q)
+		switch {
+		case u.VMs+add.VMs > *l.VMs:
+			return &store.LimitError{Message: fmt.Sprintf("You already have %d of %d machines.", u.VMs, *l.VMs)}
+		case u.CPU+add.CPU > *l.CPU:
+			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d vCPUs.", u.CPU+add.CPU, *l.CPU)}
+		case u.MemoryMiB+add.MemoryMiB > *l.MemoryMiB:
+			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d MiB of memory.", u.MemoryMiB+add.MemoryMiB, *l.MemoryMiB)}
+		case u.DiskGiB+add.DiskGiB > *l.DiskGiB:
+			return &store.LimitError{Message: fmt.Sprintf("This would use %d of your %d GiB of disk.", u.DiskGiB+add.DiskGiB, *l.DiskGiB)}
+		}
+		return nil
+	}
+}
+
+// Resize gives a machine another catalog size, within the owner's limits. Like Eject it leaves a
+// running machine alone: the new size applies when it next starts (Restart or Stop/Start here).
+func (s *Service) Resize(ctx context.Context, a Actor, id string, size config.Size) error {
+	row, _, err := s.get(ctx, a, id)
+	if err != nil {
+		return err
+	}
+	// The row is the limit's record, so it changes first; a VM update that fails after it is put
+	// right by resizing again (both steps are idempotent).
+	check := s.within(a, store.Usage{VMs: 1, CPU: size.CPU, MemoryMiB: size.MemoryMiB, DiskGiB: row.DiskGiB})
+	var le *store.LimitError
+	switch err := s.store.ResizeMachine(ctx, id, size.ID, size.CPU, size.MemoryMiB, check); {
+	case errors.As(err, &le):
+		return refuse(http.StatusForbidden, "%s", le.Message)
+	case errors.Is(err, store.ErrNotFound):
+		return ErrNotFound
+	case err != nil:
+		return s.storeError("saving the size", err)
+	}
+	memory := resource.MustParse(strconv.Itoa(size.MemoryMiB) + "Mi") // as buildVM writes it
+	for attempt := 0; ; attempt++ {
+		var vm kubevirtv1.VirtualMachine // fresh from the API server: the update is conditional on it
+		if err := s.write.Get(ctx, client.ObjectKey{Namespace: s.Namespace, Name: id}, &vm); err != nil {
+			return s.kubeError("reading the machine", err)
+		}
+		d := &vm.Spec.Template.Spec.Domain
+		d.CPU.Cores = uint32(size.CPU)
+		d.Memory.Guest = &memory
+		if d.Resources.Requests == nil {
+			d.Resources.Requests = corev1.ResourceList{}
+		}
+		d.Resources.Requests[corev1.ResourceMemory] = memory
+		err := s.write.Update(ctx, &vm)
+		if err == nil {
+			break
+		}
+		if !apierrors.IsConflict(err) || attempt == 3 {
+			return s.kubeError("resizing the machine", err)
+		}
+	}
+	s.log.Info("machine resized", "by", a.Username, "id", id, "size", size.ID)
+	return nil
 }
 
 // Eject removes a machine's install CD-ROMs (the ISO and the driver CD) from its spec so it boots

@@ -49,6 +49,7 @@ func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/vms/events", a.events)
 	mux.HandleFunc("GET /api/vms/{id}", a.read(a.get))
 	mux.HandleFunc("POST /api/vms", a.write(a.create))
+	mux.HandleFunc("PUT /api/vms/{id}/size", a.write(a.resize))
 	mux.HandleFunc("POST /api/vms/{id}/{action}", a.write(a.action))
 	mux.HandleFunc("DELETE /api/vms/{id}", a.write(a.remove))
 	for _, base := range []string{"/api/images", "/api/media"} { // media: the old name
@@ -379,6 +380,22 @@ func (a *API) action(r *http.Request, s auth.Session) (int, any, error) {
 	default:
 		return 0, nil, &machines.Error{Status: http.StatusNotFound, Message: "No such action."}
 	}
+}
+
+func (a *API) resize(r *http.Request, s auth.Session) (int, any, error) {
+	var b struct {
+		Size string `json:"size"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&b); err != nil {
+		return 0, nil, bad("The request isn't valid JSON for a size.")
+	}
+	size, ok := a.machines.Catalog.Size(b.Size)
+	if !ok {
+		return 0, nil, bad("There is no size %q.", b.Size)
+	}
+	return http.StatusNoContent, nil, a.machines.Resize(r.Context(), actor(s), r.PathValue("id"), size)
 }
 
 func (a *API) remove(r *http.Request, s auth.Session) (int, any, error) {

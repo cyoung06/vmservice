@@ -119,6 +119,9 @@ type Store interface {
 	// CreateMachine inserts m if the owner's machines plus m stay within check's limits; check
 	// returns a *LimitError when they wouldn't.
 	CreateMachine(ctx context.Context, m Machine, check func(Usage, Quota) error) error
+	// ResizeMachine sets machine id's size if the owner's other machines plus it at that size stay
+	// within check's limits; check returns a *LimitError when they wouldn't. ErrNotFound if no machine.
+	ResizeMachine(ctx context.Context, id, size string, cpu, memoryMiB int, check func(Usage, Quota) error) error
 	// MachineByName is the machine named name (names are unique across everyone).
 	MachineByName(ctx context.Context, name string) (Machine, error)
 	AllMachines(ctx context.Context) ([]Machine, error)
@@ -288,6 +291,33 @@ func (p *Postgres) CreateMachine(ctx context.Context, m Machine, check func(Usag
 		if isUniqueViolation(err) {
 			return ErrExists
 		}
+		return err
+	})
+}
+
+func (p *Postgres) ResizeMachine(ctx context.Context, id, size string, cpu, memoryMiB int, check func(Usage, Quota) error) error {
+	return p.serializable(ctx, func(tx pgx.Tx) error {
+		var owner string
+		var disk int
+		err := tx.QueryRow(ctx, `SELECT owner, disk_gib FROM machines WHERE id = $1`, id).Scan(&owner, &disk)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		u, err := scanUsage(tx.QueryRow(ctx, usageQuery+` AND id <> $2`, owner, id)) // the others
+		if err != nil {
+			return err
+		}
+		var q Quota
+		if err := tx.QueryRow(ctx, `SELECT quota_vms, quota_cpu, quota_memory_mib, quota_disk_gib FROM members WHERE owner = $1`, owner).Scan(&q.VMs, &q.CPU, &q.MemoryMiB, &q.DiskGiB); err != nil {
+			return err
+		}
+		if err := check(u, q); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `UPDATE machines SET size = $2, cpu = $3, memory_mib = $4 WHERE id = $1`, id, size, cpu, memoryMiB)
 		return err
 	})
 }

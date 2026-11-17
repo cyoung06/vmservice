@@ -5,6 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { Details } from "@/components/data/details";
+import { FormField } from "@/components/form/form-field";
+import { SelectField } from "@/components/form/select-field";
 import { PageHeader } from "@/components/layout/page-header";
 import { useSession } from "@/components/session/session-context";
 import { Button } from "@/components/ui/button";
@@ -14,8 +16,9 @@ import { TextInput } from "@/components/ui/text-input";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ErrorText } from "@/components/ui/error-text";
 import { Icon } from "@/components/ui/icon";
-import { ApiError, get, post, remove } from "@/lib/api/http";
-import type { Machine } from "@/lib/api/types";
+import { loadCatalog } from "@/lib/api/catalog";
+import { ApiError, get, post, put, remove } from "@/lib/api/http";
+import type { Catalog, Machine } from "@/lib/api/types";
 import { formatCpu, formatMemory, formatTime } from "@/lib/formatting/format";
 import { profileLabel } from "@/lib/api/images";
 import { useAction } from "@/lib/hooks/use-action";
@@ -109,10 +112,62 @@ const EjectDialog = ({ machine, onClose }: { readonly machine: Machine; readonly
   );
 };
 
+const ResizeDialog = ({ machine, onClose }: { readonly machine: Machine; readonly onClose: () => void }) => {
+  const action = useAction();
+  const [catalog, setCatalog] = useState<Catalog | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [size, setSize] = useState(machine.size);
+  useEffect(() => {
+    loadCatalog().then(setCatalog, (error: unknown) => setLoadError(messageOf(error)));
+  }, []);
+  const live = machine.state === "Running" || machine.state === "Starting";
+  return (
+    <DialogFrame
+      title="Change the size?"
+      onClose={onClose}
+      submitLabel="Change size"
+      pending={action.pending}
+      submitDisabled={catalog === null || size === machine.size}
+      error={action.error ?? loadError}
+      onSubmit={() =>
+        void action.run(() => put(`/api/vms/${encodeURIComponent(machine.id)}/size`, { size })).then((done) => {
+          if (done) {
+            onClose();
+          }
+        })
+      }
+    >
+      <div className="flex flex-col gap-3">
+        {catalog ? (
+          <FormField label="Size">
+            <SelectField
+              label="Size"
+              items={catalog.sizes.map((item) => ({
+                value: item.id,
+                label: item.name,
+                description: `${formatCpu(item.cpu)} · ${formatMemory(item.memoryMiB)}`,
+              }))}
+              value={size}
+              onChange={setSize}
+            />
+          </FormField>
+        ) : null}
+        <p className="text-[13px] text-foreground-secondary">
+          The disk stays as it is.{" "}
+          {live
+            ? "The machine keeps running at its current size; the new size applies the next time you Restart or Stop and Start it here (a restart inside the machine doesn't count)."
+            : "It applies the next time the machine starts."}
+        </p>
+      </div>
+    </DialogFrame>
+  );
+};
+
 const Actions = ({ machine }: { readonly machine: Machine }) => {
   const action = useAction();
   const [deleting, setDeleting] = useState(false);
   const [ejecting, setEjecting] = useState(false);
+  const [resizing, setResizing] = useState(false);
   const run = (verb: "start" | "stop" | "restart") =>
     void action.run(() => post(`/api/vms/${encodeURIComponent(machine.id)}/${verb}`));
   const { state } = machine;
@@ -139,6 +194,11 @@ const Actions = ({ machine }: { readonly machine: Machine }) => {
             Eject install media
           </Button>
         ) : null}
+        {state !== "Deleting" ? (
+          <Button onClick={() => setResizing(true)} leadingIcon={<Icon name="sliders" size={12} />}>
+            Resize
+          </Button>
+        ) : null}
         <Button
           variant="ghost"
           disabled={state === "Deleting"}
@@ -152,6 +212,7 @@ const Actions = ({ machine }: { readonly machine: Machine }) => {
       <ErrorText message={action.error} />
       {deleting ? <DeleteDialog machine={machine} onClose={() => setDeleting(false)} /> : null}
       {ejecting ? <EjectDialog machine={machine} onClose={() => setEjecting(false)} /> : null}
+      {resizing ? <ResizeDialog machine={machine} onClose={() => setResizing(false)} /> : null}
     </div>
   );
 };

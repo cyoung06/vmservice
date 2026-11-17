@@ -531,3 +531,44 @@ func TestImageInUseCantBeDeleted(t *testing.T) {
 		t.Errorf("deleting an ISO after eject = %v", err)
 	}
 }
+
+func TestResize(t *testing.T) {
+	s, calls := testService(t)
+	ctx := context.Background()
+	img := readyImage(t, s, alice, qcowHeader(5), 700<<20, "bios")
+	m, err := s.Create(ctx, alice, request("grow", img))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(*calls)
+	large := config.Size{ID: "large", Name: "Large", CPU: 4, MemoryMiB: 8192}
+	if err := s.Resize(ctx, alice, m.ID, large); err != nil {
+		t.Fatalf("resizing within the limits (4 vCPUs, 8 GiB) = %v", err)
+	}
+	var vm kubevirtv1.VirtualMachine
+	s.read.Get(ctx, client.ObjectKey{Namespace: "cloud", Name: m.ID}, &vm)
+	d := vm.Spec.Template.Spec.Domain
+	if d.CPU.Cores != 4 || d.Memory.Guest.String() != "8Gi" || d.Resources.Requests.Memory().String() != "8Gi" {
+		t.Errorf("VM after resize: %d cores, guest %v, request %v", d.CPU.Cores, d.Memory.Guest, d.Resources.Requests.Memory())
+	}
+	if row, _ := s.store.Machine(ctx, m.ID); row.Size != "large" || row.CPU != 4 || row.MemoryMiB != 8192 {
+		t.Errorf("row after resize = %+v", row)
+	}
+	if len(*calls) != before {
+		t.Errorf("resize restarted the machine: %v", (*calls)[before:])
+	}
+	// a second machine has no room left: the first now uses all 4 vCPUs
+	if _, err := s.Create(ctx, alice, request("other", img)); status(err) != http.StatusForbidden {
+		t.Errorf("create over the limit after resize = %v, want 403", err)
+	}
+	huge := config.Size{ID: "huge", CPU: 8, MemoryMiB: 16384}
+	if err := s.Resize(ctx, alice, m.ID, huge); status(err) != http.StatusForbidden {
+		t.Errorf("resize over the limit = %v, want 403", err)
+	}
+	if err := s.Resize(ctx, bob, m.ID, large); err != ErrNotFound {
+		t.Errorf("bob resizing alice's machine = %v, want not found", err)
+	}
+	if err := s.Resize(ctx, admin, m.ID, huge); err != nil {
+		t.Errorf("admin resize = %v (admins have no limits)", err)
+	}
+}
