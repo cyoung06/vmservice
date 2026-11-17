@@ -94,6 +94,61 @@ func TestMachines(t *testing.T) {
 	}
 }
 
+// Resize checks the other machines plus this one at its new size, and two parallel resizes that
+// would each fit alone can't both win.
+func TestResizeMachine(t *testing.T) {
+	cpu4 := func(u Usage, _ Quota) error { // checks run with the others; the caller adds the new size
+		if u.CPU+3 > 4 {
+			return &LimitError{"over"}
+		}
+		return nil
+	}
+	for name, s := range stores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			s.UpsertMember(ctx, "dave", "dave")
+			for _, id := range []string{"vm-d00001", "vm-d00002"} {
+				if err := s.CreateMachine(ctx, Machine{ID: id, Owner: "dave", Name: id[3:], Size: "small", CPU: 1, MemoryMiB: 1024, DiskGiB: 10}, limit2); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.ResizeMachine(ctx, "vm-d00001", "large", 3, 4096, cpu4); err != nil {
+				t.Fatalf("resize to 3 of 4 vCPUs = %v", err)
+			}
+			if got, _ := s.Machine(ctx, "vm-d00001"); got.Size != "large" || got.CPU != 3 || got.MemoryMiB != 4096 || got.DiskGiB != 10 {
+				t.Errorf("after resize = %+v", got)
+			}
+			if u, _ := s.Usage(ctx, "dave"); u.CPU != 4 || u.MemoryMiB != 5120 {
+				t.Errorf("usage = %+v", u)
+			}
+			if err := s.ResizeMachine(ctx, "vm-d00001", "large", 3, 4096, cpu4); err != nil {
+				t.Errorf("resizing to the same size again = %v (it counts the others, not itself)", err)
+			}
+			var le *LimitError
+			if err := s.ResizeMachine(ctx, "vm-d00002", "large", 3, 4096, cpu4); !errors.As(err, &le) {
+				t.Errorf("second machine to 3 vCPUs = %v, want a LimitError", err)
+			}
+			if err := s.ResizeMachine(ctx, "vm-nope00", "large", 3, 4096, cpu4); !errors.Is(err, ErrNotFound) {
+				t.Errorf("missing machine = %v, want ErrNotFound", err)
+			}
+			// back to 1 each, then both grow at once: only one fits
+			s.ResizeMachine(ctx, "vm-d00001", "small", 1, 1024, cpu4)
+			var wg sync.WaitGroup
+			for _, id := range []string{"vm-d00001", "vm-d00002"} {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					s.ResizeMachine(ctx, id, "large", 3, 4096, cpu4)
+				}()
+			}
+			wg.Wait()
+			if u, _ := s.Usage(ctx, "dave"); u.CPU != 4 {
+				t.Errorf("two parallel resizes left %d vCPUs in use; the limit is 4", u.CPU)
+			}
+		})
+	}
+}
+
 // Twenty parallel creates against a limit of two: exactly two rows.
 func TestLimitHoldsUnderConcurrency(t *testing.T) {
 	for name, s := range stores(t) {
